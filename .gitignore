@@ -1,0 +1,9 @@
+/target
+
+# Environment files may contain secrets - never commit them
+.env
+.env.*
+
+# Coverage artifacts
+lcov.info
+*.profraw
