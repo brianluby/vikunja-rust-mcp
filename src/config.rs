@@ -42,6 +42,17 @@ pub struct Cli {
     #[arg(long, env = "MCP_HTTP_ALLOWED_HOSTS", value_delimiter = ',')]
     pub allowed_hosts: Vec<String>,
 
+    /// Bearer token clients must present (`Authorization: Bearer <token>`)
+    /// to reach the HTTP MCP endpoint. Required for non-loopback binds
+    /// unless --http-allow-unauthenticated is set.
+    #[arg(long, env = "MCP_HTTP_AUTH_TOKEN", hide_env_values = true)]
+    pub http_auth_token: Option<String>,
+
+    /// Serve HTTP without authentication even on non-loopback binds.
+    /// Only use this behind an authenticating reverse proxy.
+    #[arg(long, env = "MCP_HTTP_ALLOW_UNAUTHENTICATED", default_value_t = false)]
+    pub http_allow_unauthenticated: bool,
+
     /// Base URL of the Vikunja instance, e.g. `https://try.vikunja.io`.
     #[arg(long, env = "VIKUNJA_URL")]
     pub vikunja_url: Option<String>,
@@ -109,6 +120,41 @@ pub enum ConfigError {
     InvalidTimeout,
     #[error("default page size must be between 1 and 250")]
     InvalidPageSize,
+    #[error("MCP_HTTP_AUTH_TOKEN is set but empty")]
+    EmptyHttpAuthToken,
+    #[error(
+        "refusing to serve unauthenticated HTTP on non-loopback address {bind}: set MCP_HTTP_AUTH_TOKEN (recommended), or pass --http-allow-unauthenticated if an authenticating reverse proxy fronts this server"
+    )]
+    UnauthenticatedNonLoopback { bind: SocketAddr },
+}
+
+/// Validates the HTTP transport's authentication configuration and returns
+/// the trimmed bearer token, if any.
+///
+/// The MCP endpoint exposes destructive Vikunja actions (and file
+/// read/write via the attachment tools), so serving it unauthenticated on a
+/// non-loopback address is refused unless explicitly allowed for
+/// reverse-proxy deployments.
+pub fn validate_http_auth(
+    bind: &SocketAddr,
+    auth_token: Option<&str>,
+    allow_unauthenticated: bool,
+) -> Result<Option<ApiToken>, ConfigError> {
+    match auth_token {
+        Some(token) => {
+            let token = token.trim();
+            if token.is_empty() {
+                return Err(ConfigError::EmptyHttpAuthToken);
+            }
+            Ok(Some(ApiToken::new(token)))
+        }
+        None => {
+            if !bind.ip().is_loopback() && !allow_unauthenticated {
+                return Err(ConfigError::UnauthenticatedNonLoopback { bind: *bind });
+            }
+            Ok(None)
+        }
+    }
 }
 
 /// Validated runtime configuration.
@@ -345,5 +391,53 @@ mod tests {
         assert_eq!(cli.transport, Transport::Stdio);
         assert_eq!(cli.bind.port(), 8077);
         assert!(cli.allowed_hosts.is_empty());
+        assert!(cli.http_auth_token.is_none());
+        assert!(!cli.http_allow_unauthenticated);
+    }
+
+    #[test]
+    fn http_auth_token_is_accepted_and_trimmed() {
+        let bind: SocketAddr = "0.0.0.0:8077".parse().unwrap();
+        let token = validate_http_auth(&bind, Some("  tk_http  "), false)
+            .unwrap()
+            .expect("token should be present");
+        assert_eq!(token.reveal(), "tk_http");
+    }
+
+    #[test]
+    fn blank_http_auth_token_is_an_error() {
+        let bind: SocketAddr = "127.0.0.1:8077".parse().unwrap();
+        assert!(matches!(
+            validate_http_auth(&bind, Some("   "), false),
+            Err(ConfigError::EmptyHttpAuthToken)
+        ));
+    }
+
+    #[test]
+    fn loopback_bind_may_skip_authentication() {
+        for bind in ["127.0.0.1:8077", "[::1]:8077"] {
+            let bind: SocketAddr = bind.parse().unwrap();
+            assert!(validate_http_auth(&bind, None, false).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn non_loopback_bind_without_token_is_refused() {
+        for bind in ["0.0.0.0:8077", "192.168.1.10:8077", "[::]:8077"] {
+            let bind: SocketAddr = bind.parse().unwrap();
+            assert!(
+                matches!(
+                    validate_http_auth(&bind, None, false),
+                    Err(ConfigError::UnauthenticatedNonLoopback { .. })
+                ),
+                "bind {bind} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn non_loopback_bind_allowed_with_explicit_opt_out() {
+        let bind: SocketAddr = "0.0.0.0:8077".parse().unwrap();
+        assert!(validate_http_auth(&bind, None, true).unwrap().is_none());
     }
 }

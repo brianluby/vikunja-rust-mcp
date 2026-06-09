@@ -67,6 +67,14 @@ pub struct AttachmentContent {
     pub content_type: Option<String>,
 }
 
+fn extract_content_type(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+}
+
 /// Async client for one Vikunja instance.
 #[derive(Debug, Clone)]
 pub struct VikunjaClient {
@@ -474,8 +482,9 @@ impl VikunjaClient {
         .await
     }
 
-    /// `DELETE /labels/{id}`.
-    pub async fn delete_label(&self, label_id: i64) -> Result<Message, Error> {
+    /// `DELETE /labels/{id}`. Unlike the other delete endpoints, the API
+    /// returns the deleted label itself rather than a `models.Message`.
+    pub async fn delete_label(&self, label_id: i64) -> Result<Label, Error> {
         self.send_empty(
             "labels.delete",
             Method::DELETE,
@@ -657,31 +666,89 @@ impl VikunjaClient {
         Self::decode(endpoint, response).await
     }
 
-    /// `GET /tasks/{id}/attachments/{attachmentID}` — download the file.
+    /// `GET /tasks/{id}/attachments/{attachmentID}` — download the file
+    /// into memory, failing with [`Error::TooLarge`] before buffering more
+    /// than `max_bytes` (via `Content-Length` when the server sends it, and
+    /// a hard cap while streaming otherwise).
     pub async fn download_attachment(
         &self,
         task_id: i64,
         attachment_id: i64,
+        max_bytes: u64,
     ) -> Result<AttachmentContent, Error> {
         let endpoint = "attachments.download";
-        debug!(endpoint, task_id, attachment_id, "download");
+        debug!(endpoint, task_id, attachment_id, max_bytes, "download");
         let builder = self
             .http
             .get(self.api_url(&format!("/tasks/{task_id}/attachments/{attachment_id}")));
-        let response = self.execute(endpoint, builder, true).await?;
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
-        let bytes = response
-            .bytes()
+        let mut response = self.execute(endpoint, builder, true).await?;
+        let content_type = extract_content_type(&response);
+        if let Some(length) = response.content_length()
+            && length > max_bytes
+        {
+            return Err(Error::TooLarge {
+                endpoint,
+                size: Some(length),
+                limit: max_bytes,
+            });
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| Error::from_reqwest(endpoint, e))?;
+            .map_err(|e| Error::from_reqwest(endpoint, e))?
+        {
+            if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
+                return Err(Error::TooLarge {
+                    endpoint,
+                    size: None,
+                    limit: max_bytes,
+                });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         Ok(AttachmentContent {
-            bytes: bytes.to_vec(),
+            bytes,
             content_type,
         })
+    }
+
+    /// `GET /tasks/{id}/attachments/{attachmentID}` — stream the file to
+    /// `path` chunk by chunk, without buffering it in memory. Returns the
+    /// number of bytes written and the reported content type.
+    pub async fn download_attachment_to_file(
+        &self,
+        task_id: i64,
+        attachment_id: i64,
+        path: &str,
+    ) -> Result<(u64, Option<String>), Error> {
+        use tokio::io::AsyncWriteExt;
+
+        let endpoint = "attachments.download";
+        debug!(endpoint, task_id, attachment_id, path, "download to file");
+        let builder = self
+            .http
+            .get(self.api_url(&format!("/tasks/{task_id}/attachments/{attachment_id}")));
+        let mut response = self.execute(endpoint, builder, true).await?;
+        let content_type = extract_content_type(&response);
+        let mut file = tokio::fs::File::create(path).await.map_err(|e| Error::Io {
+            detail: format!("could not create {path}: {e}"),
+        })?;
+        let mut written: u64 = 0;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| Error::from_reqwest(endpoint, e))?
+        {
+            file.write_all(&chunk).await.map_err(|e| Error::Io {
+                detail: format!("could not write {path}: {e}"),
+            })?;
+            written += chunk.len() as u64;
+        }
+        file.flush().await.map_err(|e| Error::Io {
+            detail: format!("could not write {path}: {e}"),
+        })?;
+        Ok((written, content_type))
     }
 
     /// `DELETE /tasks/{id}/attachments/{attachmentID}`.

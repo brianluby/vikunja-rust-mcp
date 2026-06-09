@@ -477,9 +477,10 @@ async fn labels_list_get_create_update_delete() {
         })))
         .mount(&server)
         .await;
+    // Vikunja answers label deletion with the deleted label, not a message.
     Mock::given(method("DELETE"))
         .and(path("/api/v1/labels/5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"message": "deleted"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(label.clone()))
         .mount(&server)
         .await;
 
@@ -515,7 +516,9 @@ async fn labels_list_get_create_update_delete() {
         .unwrap();
     assert_eq!(updated.title, "defect");
 
-    assert_eq!(client.delete_label(5).await.unwrap().message, "deleted");
+    let deleted = client.delete_label(5).await.unwrap();
+    assert_eq!(deleted.id, 5);
+    assert_eq!(deleted.title, "bug");
 }
 
 // ----- task labels -----------------------------------------------------------------
@@ -721,9 +724,74 @@ async fn attachment_download_returns_bytes_and_mime() {
         .await;
 
     let client = test_client(&server.uri());
-    let content = client.download_attachment(9, 4).await.unwrap();
+    let content = client.download_attachment(9, 4, 1024).await.unwrap();
     assert_eq!(content.bytes, b"file-content");
     assert_eq!(content.content_type.as_deref(), Some("text/plain"));
+}
+
+#[tokio::test]
+async fn attachment_download_rejects_bodies_over_the_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9/attachments/4"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let err = client.download_attachment(9, 4, 16).await.unwrap_err();
+    match err {
+        Error::TooLarge { size, limit, .. } => {
+            // wiremock sends Content-Length, so the request is rejected
+            // before the body is read.
+            assert_eq!(size, Some(64));
+            assert_eq!(limit, 16);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn attachment_download_to_file_streams_to_disk() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9/attachments/4"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"streamed to disk".to_vec())
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("attachment.bin");
+
+    let client = test_client(&server.uri());
+    let (written, mime) = client
+        .download_attachment_to_file(9, 4, target.to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(written, 16);
+    assert_eq!(mime.as_deref(), Some("application/octet-stream"));
+    assert_eq!(std::fs::read(&target).unwrap(), b"streamed to disk");
+}
+
+#[tokio::test]
+async fn attachment_download_to_unwritable_path_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9/attachments/4"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let err = client
+        .download_attachment_to_file(9, 4, "/nonexistent-dir/file.bin")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Io { .. }), "got {err:?}");
 }
 
 #[tokio::test]

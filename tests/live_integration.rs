@@ -171,7 +171,7 @@ async fn live_project_task_label_comment_lifecycle() {
                 .find(|a| a.file.as_ref().is_some_and(|f| f.name == "it-note.txt"))
             {
                 let content = client
-                    .download_attachment(task.id, attachment.id)
+                    .download_attachment(task.id, attachment.id, 1024 * 1024)
                     .await
                     .expect("download attachment");
                 assert_eq!(content.bytes, b"integration test attachment");

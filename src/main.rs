@@ -5,6 +5,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
+use axum::extract::Request;
+use axum::http::{StatusCode, header::AUTHORIZATION};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use clap::Parser;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -12,7 +16,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tracing::info;
 
-use vikunja_rust_mcp::config::{Cli, Config, Transport};
+use vikunja_rust_mcp::config::{ApiToken, Cli, Config, Transport, validate_http_auth};
 use vikunja_rust_mcp::mcp::VikunjaMcpServer;
 use vikunja_rust_mcp::vikunja::VikunjaClient;
 
@@ -49,18 +53,26 @@ async fn main() -> anyhow::Result<()> {
             service.waiting().await?;
         }
         Transport::Http => {
-            serve_http(server, cli.bind, cli.allowed_hosts).await?;
+            let auth_token = validate_http_auth(
+                &cli.bind,
+                cli.http_auth_token.as_deref(),
+                cli.http_allow_unauthenticated,
+            )
+            .context("invalid HTTP transport configuration")?;
+            serve_http(server, cli.bind, cli.allowed_hosts, auth_token).await?;
         }
     }
     Ok(())
 }
 
 /// Serves the MCP server over streamable HTTP at `/mcp`, with a `/healthz`
-/// endpoint for liveness checks.
+/// endpoint for liveness checks. When `auth_token` is set, `/mcp` requires
+/// `Authorization: Bearer <token>`; `/healthz` stays open.
 async fn serve_http(
     server: VikunjaMcpServer,
     bind: SocketAddr,
     extra_allowed_hosts: Vec<String>,
+    auth_token: Option<ApiToken>,
 ) -> anyhow::Result<()> {
     let mut allowed_hosts: Vec<String> = vec![
         "localhost".to_string(),
@@ -82,9 +94,23 @@ async fn serve_http(
         http_config,
     );
 
-    let router = axum::Router::new()
-        .nest_service("/mcp", service)
-        .route("/healthz", axum::routing::get(|| async { "ok" }));
+    let mut mcp_router = axum::Router::new().nest_service("/mcp", service);
+    match &auth_token {
+        Some(token) => {
+            let token = Arc::new(token.clone());
+            mcp_router = mcp_router.layer(axum::middleware::from_fn(
+                move |request: Request, next: Next| {
+                    let token = Arc::clone(&token);
+                    async move { require_bearer(&token, request, next).await }
+                },
+            ));
+            info!("HTTP MCP endpoint requires bearer authentication");
+        }
+        None => {
+            info!("HTTP MCP endpoint is served without authentication");
+        }
+    }
+    let router = mcp_router.route("/healthz", axum::routing::get(|| async { "ok" }));
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -96,6 +122,33 @@ async fn serve_http(
         .await
         .context("HTTP server failed")?;
     Ok(())
+}
+
+/// Rejects requests that do not carry `Authorization: Bearer <expected>`.
+async fn require_bearer(expected: &ApiToken, request: Request, next: Next) -> Response {
+    let authorized = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|presented| {
+            constant_time_eq(presented.as_bytes(), expected.reveal().as_bytes())
+        });
+    if authorized {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response()
+    }
+}
+
+/// Compares two byte strings without short-circuiting on the first
+/// mismatch, so the comparison time does not reveal how much of the token
+/// matched. (Length is still observable, as with most token checks.)
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn shutdown_signal() {

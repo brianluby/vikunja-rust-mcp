@@ -911,9 +911,10 @@ async fn remaining_tool_surface_round_trips() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 5, "title": "defect"})))
         .mount(&server)
         .await;
+    // Label deletion answers with the deleted label, not a message.
     Mock::given(method("DELETE"))
         .and(path("/api/v1/labels/5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"message": "label gone"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 5, "title": "bug"})))
         .mount(&server)
         .await;
 
@@ -1065,7 +1066,9 @@ async fn remaining_tool_surface_round_trips() {
     let result = call(&client, "vikunja_labels_delete", json!({"label_id": 5}))
         .await
         .unwrap();
-    assert_eq!(structured(&result)["message"], "label gone");
+    let body = structured(&result);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["message"], "label 5 (\"bug\") deleted");
 
     let result = call(&client, "vikunja_task_comments_list", json!({"task_id": 9}))
         .await
@@ -1213,7 +1216,7 @@ async fn more_argument_validation_paths() {
 /// directly (not through the MCP loop) to avoid pushing 28 MB of JSON
 /// through the transport.
 #[tokio::test]
-async fn oversized_upload_is_rejected() {
+async fn oversized_upload_from_file_is_rejected_before_reading() {
     use rmcp::handler::server::wrapper::Parameters;
     use vikunja_rust_mcp::mcp::tools::{AttachmentsUploadArgs, MAX_UPLOAD_BYTES};
 
@@ -1228,6 +1231,30 @@ async fn oversized_upload_is_rejected() {
             file_name: None,
             content_base64: None,
             file_path: Some(big_path.to_string_lossy().into_owned()),
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected oversized upload to be rejected");
+    };
+    assert!(err.message.contains("maximum supported upload"));
+}
+
+#[tokio::test]
+async fn oversized_base64_upload_is_rejected_before_decoding() {
+    use rmcp::handler::server::wrapper::Parameters;
+    use vikunja_rust_mcp::mcp::tools::{AttachmentsUploadArgs, MAX_UPLOAD_BYTES};
+
+    // A base64 string whose decoded size estimate exceeds the cap. Built
+    // from valid base64 characters so only the size check can reject it.
+    let encoded = "A".repeat((MAX_UPLOAD_BYTES / 3 + 1) * 4);
+
+    let server = vikunja_rust_mcp::mcp::VikunjaMcpServer::new(test_client("http://127.0.0.1:1"));
+    let result = server
+        .task_attachments_upload(Parameters(AttachmentsUploadArgs {
+            task_id: 9,
+            file_name: Some("big.bin".into()),
+            content_base64: Some(encoded),
+            file_path: None,
         }))
         .await;
     let Err(err) = result else {

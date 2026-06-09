@@ -39,6 +39,8 @@ Configuration comes from CLI flags or environment variables (flags win):
 | `MCP_TRANSPORT` | `--transport` | no | `stdio` | `stdio` or `http`. |
 | `MCP_HTTP_BIND` | `--bind` | no | `127.0.0.1:8077` | Bind address for the HTTP transport. |
 | `MCP_HTTP_ALLOWED_HOSTS` | `--allowed-hosts` | no | – | Extra `Host` header values to accept (comma separated). `localhost`, `127.0.0.1`, `::1` and the bind IP are always accepted. |
+| `MCP_HTTP_AUTH_TOKEN` | `--http-auth-token` | for non-loopback HTTP | – | Bearer token clients must send (`Authorization: Bearer <token>`) to reach `/mcp`. Required when binding beyond loopback. |
+| `MCP_HTTP_ALLOW_UNAUTHENTICATED` | `--http-allow-unauthenticated` | no | `false` | Explicitly serve `/mcp` without authentication on non-loopback binds (only behind an authenticating reverse proxy). |
 | `VIKUNJA_TIMEOUT_SECS` | `--timeout-secs` | no | `30` | Per-request timeout against the Vikunja API. |
 | `VIKUNJA_DEFAULT_PAGE_SIZE` | `--default-page-size` | no | `50` | `per_page` used when a tool call does not specify one (1–250; the Vikunja server also caps it). |
 
@@ -82,10 +84,25 @@ vikunja-rust-mcp --transport http --bind 127.0.0.1:8077
 ```
 
 The MCP endpoint is `http://127.0.0.1:8077/mcp` (MCP streamable HTTP);
-`GET /healthz` answers `ok` for liveness probes. When binding to a
-non-loopback address, also pass the hostname clients will use, e.g.
-`--allowed-hosts mcp.example.com` — requests with other `Host` headers are
-rejected to prevent DNS-rebinding.
+`GET /healthz` answers `ok` for liveness probes and never requires
+authentication.
+
+When binding to a **non-loopback** address the server refuses to start
+unless you either set `MCP_HTTP_AUTH_TOKEN` (clients then must send
+`Authorization: Bearer <token>` to `/mcp`) or explicitly pass
+`--http-allow-unauthenticated` because an authenticating reverse proxy
+fronts the server:
+
+```bash
+VIKUNJA_URL=https://try.vikunja.io \
+VIKUNJA_API_TOKEN=tk_... \
+MCP_HTTP_AUTH_TOKEN=$(openssl rand -hex 32) \
+vikunja-rust-mcp --transport http --bind 0.0.0.0:8077 \
+  --allowed-hosts mcp.example.com
+```
+
+Also pass the hostname clients will use via `--allowed-hosts` — requests
+with other `Host` headers are rejected to prevent DNS-rebinding.
 
 Logging goes to **stderr** (stdout carries the protocol in stdio mode) and is
 controlled with `RUST_LOG`, e.g. `RUST_LOG=vikunja_rust_mcp=debug`.
@@ -216,9 +233,15 @@ entities (cleanup is best-effort).
   arguments that read/write files **on the machine running this server** with
   the server's privileges. If that is undesirable in your deployment, restrict
   these tools in your MCP client's permission settings.
-- The HTTP transport has no built-in authentication; bind it to loopback or
-  put it behind an authenticating reverse proxy. The `Host` allow-list guards
-  against DNS-rebinding only.
+- The HTTP transport authenticates `/mcp` with a bearer token
+  (`MCP_HTTP_AUTH_TOKEN`, compared in constant time) and refuses to start on
+  non-loopback binds without one unless `--http-allow-unauthenticated` is
+  passed for reverse-proxy deployments. The `Host` allow-list additionally
+  guards against DNS-rebinding. Use TLS (via a reverse proxy) for any
+  non-local deployment so the bearer token is not sent in cleartext.
+- Attachment uploads are capped at 20 MiB and rejected before the file is
+  read into memory; inline downloads are capped at 2 MiB and aborted without
+  buffering; `save_path` downloads stream to disk.
 
 ## Vikunja API capabilities intentionally omitted
 

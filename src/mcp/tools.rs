@@ -402,6 +402,12 @@ fn non_empty(name: &str, value: &str) -> Result<(), McpError> {
     Ok(())
 }
 
+fn oversized_upload(size: usize) -> Error {
+    Error::InvalidArgument(format!(
+        "attachment is about {size} bytes; the maximum supported upload is {MAX_UPLOAD_BYTES} bytes"
+    ))
+}
+
 // ----- Tools -----------------------------------------------------------------
 
 #[tool_router(vis = "pub(crate)")]
@@ -743,10 +749,11 @@ impl VikunjaMcpServer {
         Parameters(args): Parameters<LabelIdArgs>,
     ) -> Result<Json<OperationResult>, McpError> {
         let id = positive("label_id", args.label_id)?;
-        let message = self.client().delete_label(id).await?;
+        // This endpoint returns the deleted label, not a message.
+        let label = self.client().delete_label(id).await?;
         Ok(Json(OperationResult {
             ok: true,
-            message: message.message,
+            message: format!("label {} (\"{}\") deleted", label.id, label.title),
         }))
     }
 
@@ -906,13 +913,31 @@ impl VikunjaMcpServer {
                     )
                     .to_mcp());
                 };
-                let bytes = BASE64.decode(content.trim()).map_err(|e| {
+                let content = content.trim();
+                // Reject before decoding: base64 decodes to ~3/4 of its
+                // encoded length, so this bounds the allocation below.
+                let estimated_size = content.len() / 4 * 3;
+                if estimated_size > MAX_UPLOAD_BYTES {
+                    return Err(oversized_upload(estimated_size).to_mcp());
+                }
+                let bytes = BASE64.decode(content).map_err(|e| {
                     Error::InvalidArgument(format!("content_base64 is not valid base64: {e}"))
                         .to_mcp()
                 })?;
                 (file_name, bytes)
             }
             (None, Some(path)) => {
+                // Check the size before reading so a huge file is rejected
+                // without buffering it.
+                let metadata = tokio::fs::metadata(&path).await.map_err(|e| {
+                    Error::Io {
+                        detail: format!("could not read {path}: {e}"),
+                    }
+                    .to_mcp()
+                })?;
+                if metadata.len() > MAX_UPLOAD_BYTES as u64 {
+                    return Err(oversized_upload(metadata.len() as usize).to_mcp());
+                }
                 let bytes = tokio::fs::read(&path).await.map_err(|e| {
                     Error::Io {
                         detail: format!("could not read {path}: {e}"),
@@ -930,13 +955,10 @@ impl VikunjaMcpServer {
             }
         };
         non_empty("file_name", &file_name)?;
+        // Re-check the actual byte count (the file may have grown since the
+        // metadata call; the base64 check above is an estimate).
         if bytes.len() > MAX_UPLOAD_BYTES {
-            return Err(Error::InvalidArgument(format!(
-                "attachment is {} bytes; the maximum supported upload is {} bytes",
-                bytes.len(),
-                MAX_UPLOAD_BYTES
-            ))
-            .to_mcp());
+            return Err(oversized_upload(bytes.len()).to_mcp());
         }
 
         let message = self
@@ -980,41 +1002,56 @@ impl VikunjaMcpServer {
     ) -> Result<Json<DownloadResult>, McpError> {
         let task_id = positive("task_id", args.task_id)?;
         let attachment_id = positive("attachment_id", args.attachment_id)?;
-        let content = self
-            .client()
-            .download_attachment(task_id, attachment_id)
-            .await?;
-        let size_bytes = content.bytes.len() as u64;
 
-        let (saved_to, content_base64) = match args.save_path {
+        match args.save_path {
+            // Stream straight to disk: no size limit and no full buffering.
             Some(path) => {
-                tokio::fs::write(&path, &content.bytes).await.map_err(|e| {
-                    Error::Io {
-                        detail: format!("could not write {path}: {e}"),
-                    }
-                    .to_mcp()
-                })?;
-                (Some(path), None)
+                let (size_bytes, mime) = self
+                    .client()
+                    .download_attachment_to_file(task_id, attachment_id, &path)
+                    .await?;
+                Ok(Json(DownloadResult {
+                    task_id,
+                    attachment_id,
+                    mime,
+                    size_bytes,
+                    saved_to: Some(path),
+                    content_base64: None,
+                }))
             }
+            // Inline: the client aborts the download beyond the cap.
             None => {
-                if content.bytes.len() > MAX_INLINE_DOWNLOAD_BYTES {
-                    return Err(Error::InvalidArgument(format!(
-                        "attachment is {size_bytes} bytes, larger than the {MAX_INLINE_DOWNLOAD_BYTES} byte inline limit; pass save_path to write it to disk instead"
-                    ))
-                    .to_mcp());
-                }
-                (None, Some(BASE64.encode(&content.bytes)))
+                let content = self
+                    .client()
+                    .download_attachment(
+                        task_id,
+                        attachment_id,
+                        MAX_INLINE_DOWNLOAD_BYTES as u64,
+                    )
+                    .await
+                    .map_err(|err| match err {
+                        Error::TooLarge { size, .. } => {
+                            let reported = size
+                                .map(|s| format!("attachment is {s} bytes, "))
+                                .unwrap_or_else(|| "attachment is ".to_string());
+                            Error::InvalidArgument(format!(
+                                "{reported}larger than the {MAX_INLINE_DOWNLOAD_BYTES} byte inline limit; pass save_path to write it to disk instead"
+                            ))
+                            .to_mcp()
+                        }
+                        other => other.to_mcp(),
+                    })?;
+                let size_bytes = content.bytes.len() as u64;
+                Ok(Json(DownloadResult {
+                    task_id,
+                    attachment_id,
+                    mime: content.content_type,
+                    size_bytes,
+                    saved_to: None,
+                    content_base64: Some(BASE64.encode(&content.bytes)),
+                }))
             }
-        };
-
-        Ok(Json(DownloadResult {
-            task_id,
-            attachment_id,
-            mime: content.content_type,
-            size_bytes,
-            saved_to,
-            content_base64,
-        }))
+        }
     }
 
     #[tool(

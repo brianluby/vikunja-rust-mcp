@@ -78,6 +78,16 @@ pub enum Error {
     #[error("attachment file error: {detail}")]
     Io { detail: String },
 
+    /// A response body exceeded the caller-imposed size limit and was not
+    /// buffered.
+    #[error("response from Vikunja ({endpoint}) exceeds the {limit}-byte limit")]
+    TooLarge {
+        endpoint: &'static str,
+        /// Size announced via `Content-Length`, when the server sent it.
+        size: Option<u64>,
+        limit: u64,
+    },
+
     /// A tool argument was rejected before any request was made.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
@@ -183,6 +193,19 @@ impl Error {
             Self::InvalidResponse { endpoint, .. } => McpError::internal_error(
                 self.to_string(),
                 Some(json!({ "endpoint": endpoint, "kind": "invalid_response" })),
+            ),
+            Self::TooLarge {
+                endpoint,
+                size,
+                limit,
+            } => McpError::invalid_params(
+                self.to_string(),
+                Some(json!({
+                    "endpoint": endpoint,
+                    "kind": "too_large",
+                    "size": size,
+                    "limit": limit,
+                })),
             ),
             Self::Io { .. } => McpError::internal_error(self.to_string(), None),
         }
@@ -381,6 +404,22 @@ mod tests {
         let mcp = Error::InvalidArgument("page must be >= 1".into()).to_mcp();
         assert_eq!(mcp.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(mcp.message.contains("page must be >= 1"));
+    }
+
+    #[test]
+    fn too_large_maps_to_invalid_params_with_details() {
+        let mcp = Error::TooLarge {
+            endpoint: "attachments.download",
+            size: Some(5_000_000),
+            limit: 2_097_152,
+        }
+        .to_mcp();
+        assert_eq!(mcp.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(mcp.message.contains("2097152"));
+        let data = mcp.data.expect("data should be set");
+        assert_eq!(data["kind"], "too_large");
+        assert_eq!(data["size"], 5_000_000);
+        assert_eq!(data["limit"], 2_097_152);
     }
 
     #[test]

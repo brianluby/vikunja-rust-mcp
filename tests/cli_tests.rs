@@ -13,6 +13,8 @@ fn binary() -> Command {
         .env_remove("MCP_TRANSPORT")
         .env_remove("MCP_HTTP_BIND")
         .env_remove("MCP_HTTP_ALLOWED_HOSTS")
+        .env_remove("MCP_HTTP_AUTH_TOKEN")
+        .env_remove("MCP_HTTP_ALLOW_UNAUTHENTICATED")
         .env_remove("VIKUNJA_TIMEOUT_SECS")
         .env_remove("VIKUNJA_DEFAULT_PAGE_SIZE");
     cmd
@@ -49,8 +51,10 @@ fn help_lists_options() {
         "--vikunja-url",
         "--api-token",
         "--bind",
+        "--http-auth-token",
         "VIKUNJA_URL",
         "VIKUNJA_API_TOKEN",
+        "MCP_HTTP_AUTH_TOKEN",
     ] {
         assert!(stdout.contains(needle), "--help should mention {needle}");
     }
@@ -227,6 +231,7 @@ fn http_transport_serves_mcp() {
         &format!("http://{addr}/mcp"),
         &initialize.to_string(),
         "vikunja-rust-mcp",
+        None,
     );
     assert!(
         response.contains("vikunja-rust-mcp"),
@@ -244,6 +249,110 @@ fn http_transport_serves_mcp() {
         .status();
     let status = wait_for_exit(&mut server.0);
     assert!(status.is_some(), "server did not exit after SIGINT");
+}
+
+/// With MCP_HTTP_AUTH_TOKEN set, /mcp requires the bearer token while
+/// /healthz stays open.
+#[test]
+fn http_transport_enforces_bearer_auth() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    let child = binary()
+        .args([
+            "--transport",
+            "http",
+            "--bind",
+            &addr.to_string(),
+            "--vikunja-url",
+            "http://127.0.0.1:1",
+            "--api-token",
+            "t",
+            "--http-auth-token",
+            "mcp-secret",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn server");
+    let mut server = KillOnDrop(child);
+
+    let health_url = format!("http://{addr}/healthz");
+    let mut healthy = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(response) = ureq_get(&health_url)
+            && response.contains("ok")
+        {
+            healthy = true;
+            break;
+        }
+    }
+    assert!(healthy, "server did not become healthy at {health_url}");
+
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "smoke-test", "version": "0"}
+        }
+    })
+    .to_string();
+    let mcp_url = format!("http://{addr}/mcp");
+
+    // No token: rejected before reaching the MCP service.
+    let response = http_post_mcp(&mcp_url, &initialize, "401", None);
+    assert!(response.contains("401"), "expected 401, got: {response}");
+
+    // Wrong token: rejected.
+    let response = http_post_mcp(&mcp_url, &initialize, "401", Some("wrong-token"));
+    assert!(response.contains("401"), "expected 401, got: {response}");
+
+    // Correct token: the MCP handshake answers.
+    let response = http_post_mcp(
+        &mcp_url,
+        &initialize,
+        "vikunja-rust-mcp",
+        Some("mcp-secret"),
+    );
+    assert!(
+        response.contains("vikunja-rust-mcp"),
+        "unexpected /mcp response: {response}"
+    );
+
+    let pid = server.0.id();
+    let _ = Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status();
+    let status = wait_for_exit(&mut server.0);
+    assert!(status.is_some(), "server did not exit after SIGINT");
+}
+
+/// Binding beyond loopback without authentication must refuse to start
+/// unless --http-allow-unauthenticated is passed explicitly.
+#[test]
+fn http_non_loopback_bind_requires_auth_or_explicit_opt_out() {
+    let output = binary()
+        .args([
+            "--transport",
+            "http",
+            "--bind",
+            "0.0.0.0:0",
+            "--vikunja-url",
+            "http://127.0.0.1:1",
+            "--api-token",
+            "t",
+        ])
+        .output()
+        .expect("run binary");
+    assert!(!output.status.success(), "server should refuse to start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP_HTTP_AUTH_TOKEN"),
+        "stderr was: {stderr}"
+    );
 }
 
 /// Minimal HTTP GET (avoids extra dev-dependencies for two requests).
@@ -269,7 +378,7 @@ fn ureq_get(url: &str) -> Result<String, std::io::Error> {
 /// Minimal HTTP POST for the MCP endpoint. The response is an SSE stream
 /// that stays open, so this reads until `needle` shows up (or 5s pass)
 /// instead of waiting for EOF.
-fn http_post_mcp(url: &str, body: &str, needle: &str) -> String {
+fn http_post_mcp(url: &str, body: &str, needle: &str, bearer: Option<&str>) -> String {
     use std::io::Read;
     let address = url
         .trim_start_matches("http://")
@@ -281,9 +390,12 @@ fn http_post_mcp(url: &str, body: &str, needle: &str) -> String {
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .expect("set timeout");
+    let auth_header = bearer
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     write!(
         stream,
-        "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\n{auth_header}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .expect("write request");
