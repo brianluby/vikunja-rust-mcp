@@ -361,10 +361,10 @@ entities (cleanup is best-effort).
 
 - **Pre-1.0 instances:** Vikunja < 1.0 used `GET /tasks/all`; this server
   targets the current stable API (`GET /tasks`).
-- **Kanban views/buckets, saved filters, task relations, reminders as
-  first-class tools, reactions, link/user shares, webhooks, notifications,
-  migrations**: out of scope for the core resource set this server exposes.
-  Reminders/relations still appear in task JSON where Vikunja returns them.
+- **Kanban views/buckets, saved filters, reminders as first-class tools,
+  reactions, link/user shares, webhooks, notifications, migrations**: out of
+  scope for the core resource set this server exposes. Reminders still
+  appear in task JSON where Vikunja returns them.
 - **Vikunja's native bulk endpoints** (`/tasks/bulk`, label/assignee bulk):
   not used. Bulk task operations *are* available as the `*_bulk_*` tools
   above, but they fan out over the same per-task endpoints as the

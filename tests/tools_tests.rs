@@ -2306,9 +2306,13 @@ async fn task_relations_create_surfaces_already_exists_error() {
     let ServiceError::McpError(data) = err else {
         panic!("expected MCP error, got {err:?}");
     };
+    // A conflict is user-correctable, not a server failure: it must surface
+    // as invalid_params, like the other request-level errors.
+    assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     assert!(data.message.contains("already exists"));
     let details = data.data.expect("error data");
     assert_eq!(details["http_status"], 409);
+    assert_eq!(details["kind"], "conflict");
     assert_eq!(details["vikunja_error_code"], 4012);
     assert_eq!(details["endpoint"], "task_relations.create");
     client.cancel().await.unwrap();

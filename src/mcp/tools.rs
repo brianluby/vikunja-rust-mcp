@@ -502,8 +502,8 @@ pub struct BulkTaskResult {
 #[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct BulkItemError {
     /// Error category: `auth`, `forbidden`, `not_found`, `validation`,
-    /// `rate_limited`, `server`, `network`, `timeout`, `invalid_response`,
-    /// `io`, `too_large`, `invalid_argument` or `other`.
+    /// `conflict`, `rate_limited`, `server`, `network`, `timeout`,
+    /// `invalid_response`, `io`, `too_large`, `invalid_argument` or `other`.
     pub kind: String,
     /// HTTP status reported by Vikunja, when the API answered.
     pub http_status: Option<u16>,
@@ -524,6 +524,7 @@ impl BulkItemError {
                     ApiErrorKind::Forbidden => "forbidden",
                     ApiErrorKind::NotFound => "not_found",
                     ApiErrorKind::Validation => "validation",
+                    ApiErrorKind::Conflict => "conflict",
                     ApiErrorKind::RateLimited => "rate_limited",
                     ApiErrorKind::Server => "server",
                     ApiErrorKind::Other => "other",
