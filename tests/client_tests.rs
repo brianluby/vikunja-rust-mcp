@@ -1669,3 +1669,37 @@ async fn append_task_reminder_starts_list_when_absent() {
     let task = client.append_task_reminder(9, &reminder).await.unwrap();
     assert_eq!(task.reminders.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn append_task_reminder_rejects_malformed_reminders_shape() {
+    let server = MockServer::start().await;
+    // A non-array, non-null `reminders` must fail fast instead of being
+    // silently overwritten and written back.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": {"unexpected": "object"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let reminder = TaskReminder {
+        reminder: Some("2026-07-01T09:00:00Z".into()),
+        relative_period: None,
+        relative_to: None,
+    };
+    let err = client.append_task_reminder(9, &reminder).await.unwrap_err();
+    let Error::InvalidResponse { detail, .. } = err else {
+        panic!("expected InvalidResponse, got {err:?}");
+    };
+    assert!(detail.contains("reminders"));
+}

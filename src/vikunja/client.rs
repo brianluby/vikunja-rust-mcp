@@ -30,6 +30,18 @@ use super::pagination::{BoundedPage, Page, PageInfo, PageParams, walk_pages};
 /// How long to wait before the single retry of an idempotent request.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// JSON type name for error messages about unexpected response shapes.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 /// Options for listing tasks via `GET /tasks`.
 #[derive(Debug, Clone, Default)]
 pub struct TaskListOptions {
@@ -476,9 +488,20 @@ impl VikunjaClient {
             })?;
         match target.get_mut("reminders") {
             Some(Value::Array(reminders)) => reminders.push(reminder_value),
-            _ => {
+            None | Some(Value::Null) => {
                 // Absent or `null` (Go's empty-slice serialization).
                 target.insert("reminders".to_string(), Value::Array(vec![reminder_value]));
+            }
+            Some(other) => {
+                // Any other shape is a malformed response; fail fast
+                // instead of overwriting it and writing the task back.
+                return Err(Error::InvalidResponse {
+                    endpoint: "tasks.get",
+                    detail: format!(
+                        "expected reminders to be an array or null, got {}",
+                        json_type_name(other)
+                    ),
+                });
             }
         }
         self.send_json("task_reminders.add", Method::POST, &path, &current)
