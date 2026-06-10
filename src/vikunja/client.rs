@@ -60,6 +60,18 @@ impl TaskListOptions {
     }
 }
 
+/// Result of a bounded multi-page task listing: the concatenated tasks plus
+/// metadata about how far pagination got.
+#[derive(Debug, Clone)]
+pub struct BoundedTasks {
+    pub tasks: Vec<Task>,
+    /// Number of pages actually fetched (at least 1).
+    pub pages_read: u32,
+    /// True when the page cap was hit while the server still reported more
+    /// pages (`has_more == Some(true)` on the last fetched page).
+    pub truncated: bool,
+}
+
 /// A downloaded attachment body.
 #[derive(Debug, Clone)]
 pub struct AttachmentContent {
@@ -833,24 +845,45 @@ impl VikunjaClient {
         Ok(all)
     }
 
-    /// Fetches up to `max_pages` pages of tasks and concatenates them.
+    /// Fetches up to `max_pages` pages of tasks and concatenates them,
+    /// discarding the pagination metadata.
     pub async fn list_all_tasks(&self, max_pages: u32) -> Result<Vec<Task>, Error> {
-        let mut all = Vec::new();
+        let result = self
+            .list_all_tasks_with_options(&TaskListOptions::default(), max_pages)
+            .await?;
+        Ok(result.tasks)
+    }
+
+    /// Fetches up to `max_pages` pages of tasks matching `options`,
+    /// concatenating them and reporting how far pagination got. Any `page`
+    /// set on `options` is overridden while walking the pages. At least one
+    /// page is always fetched, so `pages_read` is at least 1 even when
+    /// `max_pages` is 0.
+    pub async fn list_all_tasks_with_options(
+        &self,
+        options: &TaskListOptions,
+        max_pages: u32,
+    ) -> Result<BoundedTasks, Error> {
+        let mut tasks = Vec::new();
         let mut page = 1u32;
         loop {
             let result = self
                 .list_tasks(&TaskListOptions {
                     page: Some(page),
-                    ..Default::default()
+                    ..options.clone()
                 })
                 .await?;
-            all.extend(result.items);
-            if result.info.has_more != Some(true) || page >= max_pages {
-                break;
+            tasks.extend(result.items);
+            let has_more = result.info.has_more == Some(true);
+            if !has_more || page >= max_pages {
+                return Ok(BoundedTasks {
+                    tasks,
+                    pages_read: page,
+                    truncated: has_more,
+                });
             }
             page += 1;
         }
-        Ok(all)
     }
 
     /// Lightweight connectivity probe used by the status resource: requests

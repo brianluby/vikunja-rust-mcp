@@ -1840,6 +1840,179 @@ async fn tasks_resource_lists_tasks() {
     client.cancel().await.unwrap();
 }
 
+/// Reads a resource and parses its JSON body, asserting the MIME type and
+/// that the API token never leaks into the output.
+async fn read_json_resource(client: &McpClient, uri: &str) -> serde_json::Value {
+    let result = client
+        .read_resource(ReadResourceRequestParams::new(uri))
+        .await
+        .unwrap();
+    let ResourceContents::TextResourceContents {
+        text, mime_type, ..
+    } = &result.contents[0]
+    else {
+        panic!("expected text contents for {uri}");
+    };
+    assert_eq!(mime_type.as_deref(), Some("application/json"), "{uri}");
+    assert!(!text.contains(common::TEST_TOKEN), "{uri} leaks the token");
+    serde_json::from_str(text).unwrap()
+}
+
+#[tokio::test]
+async fn task_view_resources_are_advertised() {
+    let client = connect("http://127.0.0.1:1").await;
+    let resources = client.list_resources(None).await.unwrap();
+    for uri in [
+        "vikunja://tasks/today",
+        "vikunja://tasks/overdue",
+        "vikunja://tasks/upcoming",
+        "vikunja://tasks/high-priority",
+        "vikunja://tasks/inbox",
+        "vikunja://tasks/recently-updated",
+    ] {
+        let resource = resources
+            .resources
+            .iter()
+            .find(|r| r.raw.uri == uri)
+            .unwrap_or_else(|| panic!("{uri} not advertised"));
+        assert_eq!(resource.raw.mime_type.as_deref(), Some("application/json"));
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_view_resources_send_exact_filters() {
+    // (uri, view, expected filter or "" for none, sort_by, order_by)
+    let cases: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "vikunja://tasks/today",
+            "today",
+            "done = false && due_date >= now/d && due_date < now/d+1d",
+            "due_date",
+            "asc",
+        ),
+        (
+            "vikunja://tasks/overdue",
+            "overdue",
+            "done = false && due_date < now/d && due_date != null",
+            "due_date",
+            "asc",
+        ),
+        (
+            "vikunja://tasks/upcoming",
+            "upcoming",
+            "done = false && due_date >= now/d && due_date < now/d+7d",
+            "due_date",
+            "asc",
+        ),
+        (
+            "vikunja://tasks/high-priority",
+            "high-priority",
+            "done = false && priority >= 3",
+            "priority",
+            "desc",
+        ),
+        (
+            "vikunja://tasks/inbox",
+            "inbox",
+            "done = false && due_date = null",
+            "updated",
+            "desc",
+        ),
+        (
+            "vikunja://tasks/recently-updated",
+            "recently-updated",
+            "",
+            "updated",
+            "desc",
+        ),
+    ];
+
+    for (uri, view, filter, sort_by, order_by) in cases {
+        let server = MockServer::start().await;
+        let mut mock = Mock::given(method("GET"))
+            .and(path("/api/v1/tasks"))
+            .and(query_param("page", "1"))
+            .and(query_param("sort_by", *sort_by))
+            .and(query_param("order_by", *order_by));
+        if filter.is_empty() {
+            mock = mock.and(wiremock::matchers::query_param_is_missing("filter"));
+        } else {
+            mock = mock.and(query_param("filter", *filter));
+        }
+        mock.respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 1, "title": "Plan week", "project_id": 1}]))
+                .insert_header("x-pagination-total-pages", "1"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+        let client = connect(&server.uri()).await;
+        let parsed = read_json_resource(&client, uri).await;
+        assert_eq!(parsed["view"], *view, "{uri}");
+        if filter.is_empty() {
+            assert_eq!(parsed["filter"], serde_json::Value::Null, "{uri}");
+        } else {
+            assert_eq!(parsed["filter"], *filter, "{uri}");
+        }
+        assert_eq!(parsed["sort_by"], *sort_by, "{uri}");
+        assert_eq!(parsed["order_by"], *order_by, "{uri}");
+        assert_eq!(parsed["page_cap"], 10, "{uri}");
+        assert_eq!(parsed["pages_read"], 1, "{uri}");
+        assert_eq!(parsed["truncated"], false, "{uri}");
+        assert_eq!(parsed["count"], 1, "{uri}");
+        assert_eq!(parsed["tasks"][0]["title"], "Plan week", "{uri}");
+        assert!(
+            parsed["description"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty()),
+            "{uri}"
+        );
+        client.cancel().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn task_view_resource_reports_truncation_at_page_cap() {
+    let server = MockServer::start().await;
+    for page in 1..=10u32 {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tasks"))
+            .and(query_param("page", page.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(
+                        json!([{"id": page, "title": format!("T{page}"), "project_id": 1}]),
+                    )
+                    .insert_header("x-pagination-total-pages", "25"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = connect(&server.uri()).await;
+    let parsed = read_json_resource(&client, "vikunja://tasks/recently-updated").await;
+    assert_eq!(parsed["page_cap"], 10);
+    assert_eq!(parsed["pages_read"], 10);
+    assert_eq!(parsed["truncated"], true);
+    assert_eq!(parsed["count"], 10);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_view_reads_propagate_api_errors() {
+    let client = connect("http://127.0.0.1:1").await;
+    let err = client
+        .read_resource(ReadResourceRequestParams::new("vikunja://tasks/today"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::McpError(_)), "got {err:?}");
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn resource_reads_propagate_api_errors() {
     // Vikunja unreachable: list resources must fail, not hang or panic.
