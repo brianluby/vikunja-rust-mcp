@@ -444,8 +444,13 @@ pub fn saved_filter_pseudo_project_id(filter_id: i64) -> i64 {
 
 /// The saved filter id behind a pseudo-project id, if it is one
 /// (ids <= -2; -1 is reserved and positive ids are real projects).
+/// Project ids come from API responses, so `i64::MIN` (whose negation is
+/// not representable) is rejected instead of overflowing.
 pub fn saved_filter_id_from_project_id(project_id: i64) -> Option<i64> {
-    (project_id <= -2).then_some(-project_id - 1)
+    if project_id > -2 {
+        return None;
+    }
+    project_id.checked_neg().map(|negated| negated - 1)
 }
 
 /// Generic `{"message": "..."}` response (`models.Message`).
@@ -638,6 +643,13 @@ mod tests {
         assert_eq!(saved_filter_id_from_project_id(7), None);
         assert_eq!(saved_filter_id_from_project_id(0), None);
         assert_eq!(saved_filter_id_from_project_id(-1), None);
+        // i64::MIN has no representable negation; a corrupted or malicious
+        // API response must not overflow.
+        assert_eq!(saved_filter_id_from_project_id(i64::MIN), None);
+        assert_eq!(
+            saved_filter_id_from_project_id(i64::MIN + 1),
+            Some(i64::MAX - 1)
+        );
     }
 
     #[test]
