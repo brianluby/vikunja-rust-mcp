@@ -14,11 +14,13 @@ use serde::{Deserialize, Serialize};
 use crate::dates::{self, DateConfig, Resolution};
 use crate::error::{ApiErrorKind, Error};
 use crate::schema::strip_unsigned_formats;
+use crate::vikunja::VikunjaClient;
 use crate::vikunja::client::{TaskListOptions, saved_filter_options};
 use crate::vikunja::models::{
-    Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, RelationKind,
-    SavedFilter, SavedFilterCreate, SavedFilterQuery, SavedFilterSummary, SavedFilterUpdate, Task,
-    TaskAttachment, TaskComment, TaskCreate, TaskRelation, TaskUpdate, Team, User,
+    Bucket, Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, ProjectView,
+    RelationKind, SavedFilter, SavedFilterCreate, SavedFilterQuery, SavedFilterSummary,
+    SavedFilterUpdate, Task, TaskAttachment, TaskComment, TaskCreate, TaskRelation, TaskUpdate,
+    Team, User,
 };
 use crate::vikunja::pagination::{BoundedPage, PageInfo, PageParams, walk_pages};
 
@@ -43,6 +45,8 @@ pub const MAX_AUTO_MAX_PAGES: u32 = 50;
 /// (Vikunja has no `GET /filters` list endpoint). With the default page
 /// size of 50 this covers 500 entries.
 pub const MAX_FILTER_LIST_PAGES: u32 = 10;
+/// Page cap when walking a project's views to find its kanban view.
+pub const MAX_VIEW_RESOLUTION_PAGES: u32 = 10;
 
 // ----- Shared argument/output shapes ----------------------------------------
 
@@ -618,6 +622,80 @@ pub struct DatesResolveResult {
     pub default_time_used: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct ProjectViewsListArgs {
+    /// Numeric id of the project.
+    pub project_id: i64,
+    /// 1-based page number (default 1).
+    pub page: Option<u32>,
+    /// Items per page.
+    pub per_page: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct BucketsListArgs {
+    /// Numeric id of the project.
+    pub project_id: i64,
+    /// Numeric id of the kanban view to read. When omitted, the project's
+    /// first kanban view is used (find views with vikunja_project_views_list).
+    pub view_id: Option<i64>,
+    /// 1-based page number (default 1). Paginates buckets; each bucket also
+    /// carries at most one page of its tasks.
+    pub page: Option<u32>,
+    /// Items per page.
+    pub per_page: Option<u32>,
+}
+
+/// Views of one project. Unlike the other list results there is no
+/// auto-pagination variant: a project only ever has a handful of views.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProjectViewListResult {
+    pub views: Vec<ProjectView>,
+    pub pagination: PageInfo,
+}
+
+/// One kanban lane with its tasks and name, plus the flags that need the
+/// view definition to resolve.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BucketInfo {
+    pub id: i64,
+    pub title: String,
+    /// Maximum number of tasks allowed in the bucket; 0 means no limit.
+    pub limit: i64,
+    /// Number of tasks in the bucket as counted by the server.
+    pub count: i64,
+    pub position: f64,
+    /// True when new tasks land in this bucket by default. Only known when
+    /// the view definition was fetched (i.e. view_id was auto-resolved);
+    /// omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_default_bucket: Option<bool>,
+    /// True when tasks in this bucket are treated as done. Only known when
+    /// the view definition was fetched; omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_done_bucket: Option<bool>,
+    /// Tasks currently in this bucket (one page per bucket); omitted when
+    /// the bucket is empty and Vikunja sends no list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<Task>>,
+}
+
+/// The buckets of one project's kanban view.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BucketsListResult {
+    pub project_id: i64,
+    /// Id of the kanban view the buckets belong to.
+    pub view_id: i64,
+    /// Title of the view, when its definition was fetched (omitted with an
+    /// explicit view_id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_title: Option<String>,
+    pub buckets: Vec<BucketInfo>,
+    pub pagination: PageInfo,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ProjectListResult {
     pub projects: Vec<Project>,
@@ -1086,6 +1164,69 @@ where
         timezone_description,
         default_time_used,
     }))
+}
+
+/// Loads the buckets of a project's kanban view. With an explicit
+/// `view_id` the buckets are fetched directly; otherwise the project's
+/// views are listed and the first kanban view is used (its definition then
+/// also resolves the default/done bucket flags). Shared by the
+/// vikunja_buckets_list tool and the projects/{id}/buckets resource.
+pub(crate) async fn load_project_buckets(
+    client: &VikunjaClient,
+    project_id: i64,
+    view_id: Option<i64>,
+    params: PageParams,
+) -> Result<BucketsListResult, Error> {
+    let view: Option<ProjectView> = match view_id {
+        Some(_) => None,
+        None => {
+            // Walk all view pages (bounded): a project's kanban view must
+            // not be missed just because it sits beyond the first page.
+            let views = walk_pages(MAX_VIEW_RESOLUTION_PAGES, |page| {
+                client.list_project_views(project_id, PageParams::new(Some(page), None))
+            })
+            .await?;
+            let kanban = views.items.into_iter().find(ProjectView::is_kanban);
+            Some(kanban.ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "project {project_id} has no kanban view; check its views with \
+                     vikunja_project_views_list or pass view_id explicitly"
+                ))
+            })?)
+        }
+    };
+    let view_id = match (view_id, view.as_ref()) {
+        (Some(id), _) => id,
+        (None, Some(view)) => view.id,
+        (None, None) => unreachable!("view resolution always yields an id or errors"),
+    };
+
+    let page = client
+        .list_view_buckets(project_id, view_id, params)
+        .await?;
+    let buckets = page
+        .items
+        .into_iter()
+        .map(|bucket: Bucket| BucketInfo {
+            is_default_bucket: view
+                .as_ref()
+                .map(|view| view.default_bucket_id == bucket.id),
+            is_done_bucket: view.as_ref().map(|view| view.done_bucket_id == bucket.id),
+            id: bucket.id,
+            title: bucket.title,
+            limit: bucket.limit,
+            count: bucket.count,
+            position: bucket.position,
+            tasks: bucket.tasks,
+        })
+        .collect();
+    Ok(BucketsListResult {
+        project_id,
+        view_id,
+        view_title: view.map(|view| view.title),
+        buckets,
+        pagination: page.info,
+    })
 }
 
 fn oversized_upload(size: usize) -> Error {
@@ -2294,6 +2435,45 @@ impl VikunjaMcpServer {
             pagination: page.info,
             auto_pagination: None,
         }))
+    }
+
+    // -- Project views & kanban buckets --
+
+    #[tool(
+        name = "vikunja_project_views_list",
+        description = "List the views (list, gantt, table, kanban) configured for a Vikunja project. Kanban boards are views with view_kind 'kanban'; use their id with vikunja_buckets_list.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn project_views_list(
+        &self,
+        Parameters(args): Parameters<ProjectViewsListArgs>,
+    ) -> Result<Json<ProjectViewListResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        let params = page_params(args.page, args.per_page)?;
+        let page = self.client().list_project_views(project_id, params).await?;
+        Ok(Json(ProjectViewListResult {
+            views: page.items,
+            pagination: page.info,
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_buckets_list",
+        description = "List the Kanban buckets (board lanes like Backlog/Doing/Done) of a Vikunja project, including each bucket's name and the tasks in it. Without view_id, the project's first kanban view is used.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn buckets_list(
+        &self,
+        Parameters(args): Parameters<BucketsListArgs>,
+    ) -> Result<Json<BucketsListResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        if let Some(view_id) = args.view_id {
+            positive("view_id", view_id)?;
+        }
+        let params = page_params(args.page, args.per_page)?;
+        Ok(Json(
+            load_project_buckets(self.client(), project_id, args.view_id, params).await?,
+        ))
     }
 
     // -- Saved filters --
