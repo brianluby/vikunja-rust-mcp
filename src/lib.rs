@@ -7,6 +7,7 @@
 //! - [`mcp`]: the MCP server, tool and resource definitions built on `rmcp`.
 
 pub mod config;
+pub mod dates;
 pub mod error;
 pub mod mcp;
 pub mod schema;
