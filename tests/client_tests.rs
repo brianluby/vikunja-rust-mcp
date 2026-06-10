@@ -1074,6 +1074,69 @@ async fn list_all_tasks_respects_page_cap() {
 }
 
 #[tokio::test]
+async fn list_all_tasks_with_options_forwards_query_and_reports_metadata() {
+    let server = MockServer::start().await;
+    for page in 1..=2u32 {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tasks"))
+            .and(query_param("page", page.to_string()))
+            .and(query_param("filter", "done = false && priority >= 3"))
+            .and(query_param("sort_by", "priority"))
+            .and(query_param("order_by", "desc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([task_json(page as i64, "t", false)]))
+                    .insert_header("x-pagination-total-pages", "2"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = test_client(&server.uri());
+    let options = TaskListOptions {
+        filter: Some("done = false && priority >= 3".into()),
+        sort_by: Some("priority".into()),
+        order_by: Some("desc".into()),
+        ..Default::default()
+    };
+    let result = client
+        .list_all_tasks_with_options(&options, 10)
+        .await
+        .unwrap();
+    assert_eq!(result.tasks.len(), 2);
+    assert_eq!(result.pages_read, 2);
+    assert!(!result.truncated);
+}
+
+#[tokio::test]
+async fn list_all_tasks_with_options_reports_truncation_at_cap() {
+    let server = MockServer::start().await;
+    for page in 1..=2u32 {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tasks"))
+            .and(query_param("page", page.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([task_json(page as i64, "t", false)]))
+                    .insert_header("x-pagination-total-pages", "100"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = test_client(&server.uri());
+    let result = client
+        .list_all_tasks_with_options(&TaskListOptions::default(), 2)
+        .await
+        .unwrap();
+    assert_eq!(result.tasks.len(), 2);
+    assert_eq!(result.pages_read, 2);
+    assert!(result.truncated, "cap hit with more pages must truncate");
+}
+
+#[tokio::test]
 async fn probe_reports_success_status() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

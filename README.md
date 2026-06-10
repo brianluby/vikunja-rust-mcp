@@ -197,8 +197,65 @@ The `*_bulk_*` tools are deliberately conservative:
 | `vikunja://status` | Server name/version, configured instance URL, connectivity probe — never the token. |
 | `vikunja://projects` | All projects (auto-paginated, capped at 10 pages). |
 | `vikunja://tasks` | Tasks across projects (auto-paginated, capped at 10 pages). |
+| `vikunja://tasks/today` | Open tasks due today (task view). |
+| `vikunja://tasks/overdue` | Open tasks due before today (task view). |
+| `vikunja://tasks/upcoming` | Open tasks due in the next 7 days (task view). |
+| `vikunja://tasks/high-priority` | Open tasks with priority >= 3 (task view). |
+| `vikunja://tasks/inbox` | Open tasks without a due date (task view). |
+| `vikunja://tasks/recently-updated` | All tasks, most recently updated first (task view). |
 | `vikunja://projects/{id}` | One project (resource template). |
 | `vikunja://tasks/{id}` | One task (resource template). |
+
+### Task view resources
+
+The `vikunja://tasks/<view>` resources are convenience read-only views over
+Vikunja filter expressions, so agents can read common planning views without
+constructing filter syntax themselves. Each view applies a fixed filter and
+sort order through the regular `GET /tasks` endpoint:
+
+| View | Filter | Sort |
+|---|---|---|
+| `today` | `done = false && due_date >= now/d && due_date < now/d+1d` | `due_date` asc |
+| `overdue` | `done = false && due_date < now/d && due_date != null` | `due_date` asc |
+| `upcoming` | `done = false && due_date >= now/d && due_date < now/d+7d` | `due_date` asc |
+| `high-priority` | `done = false && priority >= 3` | `priority` desc |
+| `inbox` | `done = false && due_date = null` | `updated` desc |
+| `recently-updated` | *(none)* | `updated` desc |
+
+Notes on the definitions:
+
+- `now/d` is Vikunja date math for "start of today"; `due_date = null` /
+  `due_date != null` is Vikunja (>= 1.0) filter syntax for tasks without /
+  with a due date.
+- `inbox` uses a conservative cross-instance definition of "unplanned":
+  open tasks that have no due date, sorted by last update (descending).
+- `upcoming` starts at today, so it never overlaps with `overdue` but does
+  include everything in `today`.
+- `recently-updated` intentionally applies no `done` filter — it is a recent
+  activity feed including completed tasks.
+
+Like the other list resources, each view is auto-paginated and capped at 10
+pages. The JSON body embeds the view definition and pagination metadata:
+
+```json
+{
+  "view": "today",
+  "description": "Open tasks due today, sorted by due date (ascending).",
+  "filter": "done = false && due_date >= now/d && due_date < now/d+1d",
+  "sort_by": "due_date",
+  "order_by": "asc",
+  "page_cap": 10,
+  "pages_read": 1,
+  "truncated": false,
+  "count": 2,
+  "tasks": []
+}
+```
+
+`truncated` is `true` when the page cap was hit while the server still
+reported more pages. Every view can be replicated (and customized, e.g.
+restricted to one project or paginated past the cap) by calling the
+`vikunja_tasks_list` tool with the same `filter`, `sort_by` and `order_by`.
 
 ## Error handling
 
