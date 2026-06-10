@@ -11,9 +11,10 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::vikunja::VikunjaClient;
-use crate::vikunja::client::TaskListOptions;
+use crate::vikunja::client::{TaskListOptions, saved_filter_options};
 
 pub const STATUS_URI: &str = "vikunja://status";
+pub const FILTERS_URI: &str = "vikunja://filters";
 pub const PROJECTS_URI: &str = "vikunja://projects";
 pub const TASKS_URI: &str = "vikunja://tasks";
 pub const TASKS_TODAY_URI: &str = "vikunja://tasks/today";
@@ -24,6 +25,8 @@ pub const TASKS_INBOX_URI: &str = "vikunja://tasks/inbox";
 pub const TASKS_RECENTLY_UPDATED_URI: &str = "vikunja://tasks/recently-updated";
 pub const PROJECT_URI_PREFIX: &str = "vikunja://projects/";
 pub const TASK_URI_PREFIX: &str = "vikunja://tasks/";
+pub const FILTER_URI_PREFIX: &str = "vikunja://filters/";
+const FILTER_TASKS_SUFFIX: &str = "/tasks";
 
 /// Cap on auto-pagination when rendering list resources, to keep resource
 /// reads bounded. With the default page size of 50 this covers 500 items.
@@ -168,6 +171,14 @@ pub fn list() -> Vec<Resource> {
             )
             .with_mime_type("application/json")
             .no_annotation(),
+        RawResource::new(FILTERS_URI, "vikunja-filters")
+            .with_title("All saved Vikunja filters")
+            .with_description(
+                "Saved filters visible to the configured API token: durable, named \
+                 task queries, listed with their filter id and pseudo-project id.",
+            )
+            .with_mime_type("application/json")
+            .no_annotation(),
     ];
     resources.extend(TaskView::ALL.into_iter().map(|view| {
         RawResource::new(view.uri(), format!("vikunja-tasks-{}", view.slug()))
@@ -192,6 +203,22 @@ pub fn templates() -> Vec<ResourceTemplate> {
             .with_description("One task by numeric id, including labels and assignees.")
             .with_mime_type("application/json")
             .no_annotation(),
+        RawResourceTemplate::new("vikunja://filters/{id}", "vikunja-filter")
+            .with_title("A single saved Vikunja filter")
+            .with_description(
+                "One saved filter by numeric id, including its stored filter \
+                 expression and sort order.",
+            )
+            .with_mime_type("application/json")
+            .no_annotation(),
+        RawResourceTemplate::new("vikunja://filters/{id}/tasks", "vikunja-filter-tasks")
+            .with_title("Tasks matching a saved Vikunja filter")
+            .with_description(
+                "The tasks a saved filter currently matches, computed by \
+                 evaluating its stored query (bounded to the first 10 pages).",
+            )
+            .with_mime_type("application/json")
+            .no_annotation(),
     ]
 }
 
@@ -201,6 +228,7 @@ pub async fn read(client: &VikunjaClient, uri: &str) -> Result<ReadResourceResul
         STATUS_URI => status(client).await,
         PROJECTS_URI => projects(client).await,
         TASKS_URI => tasks(client).await,
+        FILTERS_URI => saved_filters(client).await,
         _ => {
             if let Some(view) = TaskView::from_uri(uri) {
                 return task_view(client, view).await;
@@ -212,6 +240,13 @@ pub async fn read(client: &VikunjaClient, uri: &str) -> Result<ReadResourceResul
             if let Some(id) = parse_id(uri, TASK_URI_PREFIX) {
                 let task = client.get_task(id).await.map_err(|e| e.to_mcp())?;
                 return Ok(json_result(uri, &task));
+            }
+            if let Some(id) = parse_filter_tasks_id(uri) {
+                return saved_filter_tasks(client, uri, id).await;
+            }
+            if let Some(id) = parse_id(uri, FILTER_URI_PREFIX) {
+                let filter = client.get_saved_filter(id).await.map_err(|e| e.to_mcp())?;
+                return Ok(json_result(uri, &filter));
             }
             Err(McpError::resource_not_found(
                 format!("unknown resource URI: {uri}"),
@@ -286,6 +321,56 @@ async fn task_view(client: &VikunjaClient, view: TaskView) -> Result<ReadResourc
     Ok(json_result(view.uri(), &body))
 }
 
+/// Lists saved filters (derived from the pseudo-projects Vikunja adds to
+/// the project list; there is no `GET /filters` endpoint).
+async fn saved_filters(client: &VikunjaClient) -> Result<ReadResourceResult, McpError> {
+    let filters = client
+        .list_saved_filters(MAX_RESOURCE_PAGES)
+        .await
+        .map_err(|e| e.to_mcp())?;
+    let body = json!({ "count": filters.len(), "filters": filters });
+    Ok(json_result(FILTERS_URI, &body))
+}
+
+/// Renders the tasks a saved filter currently matches by evaluating its
+/// stored query, bounded by [`MAX_RESOURCE_PAGES`] like the task views.
+async fn saved_filter_tasks(
+    client: &VikunjaClient,
+    uri: &str,
+    filter_id: i64,
+) -> Result<ReadResourceResult, McpError> {
+    let filter = client
+        .get_saved_filter(filter_id)
+        .await
+        .map_err(|e| e.to_mcp())?;
+    let options = saved_filter_options(&filter);
+    let result = client
+        .list_all_tasks_with_options(&options, MAX_RESOURCE_PAGES)
+        .await
+        .map_err(|e| e.to_mcp())?;
+    let body = json!({
+        "filter_id": filter_id,
+        "title": filter.title,
+        "filter": options.filter,
+        "sort_by": options.sort_by,
+        "order_by": options.order_by,
+        "page_cap": MAX_RESOURCE_PAGES,
+        "pages_read": result.pages_read,
+        "truncated": result.truncated,
+        "count": result.tasks.len(),
+        "tasks": result.tasks,
+    });
+    Ok(json_result(uri, &body))
+}
+
+/// Extracts the filter id from a `vikunja://filters/{id}/tasks` URI.
+fn parse_filter_tasks_id(uri: &str) -> Option<i64> {
+    let id = uri
+        .strip_prefix(FILTER_URI_PREFIX)?
+        .strip_suffix(FILTER_TASKS_SUFFIX)?;
+    id.parse::<i64>().ok().filter(|id| *id > 0)
+}
+
 fn parse_id(uri: &str, prefix: &str) -> Option<i64> {
     uri.strip_prefix(prefix)
         .and_then(|raw| raw.parse::<i64>().ok())
@@ -317,6 +402,7 @@ mod tests {
                 STATUS_URI,
                 PROJECTS_URI,
                 TASKS_URI,
+                FILTERS_URI,
                 TASKS_TODAY_URI,
                 TASKS_OVERDUE_URI,
                 TASKS_UPCOMING_URI,
@@ -418,9 +504,14 @@ mod tests {
     #[test]
     fn templates_are_advertised() {
         let templates = templates();
-        assert_eq!(templates.len(), 2);
+        assert_eq!(templates.len(), 4);
         assert_eq!(templates[0].raw.uri_template, "vikunja://projects/{id}");
         assert_eq!(templates[1].raw.uri_template, "vikunja://tasks/{id}");
+        assert_eq!(templates[2].raw.uri_template, "vikunja://filters/{id}");
+        assert_eq!(
+            templates[3].raw.uri_template,
+            "vikunja://filters/{id}/tasks"
+        );
     }
 
     #[test]
@@ -430,6 +521,26 @@ mod tests {
         assert_eq!(parse_id("vikunja://tasks/-3", TASK_URI_PREFIX), None);
         assert_eq!(parse_id("vikunja://tasks/abc", TASK_URI_PREFIX), None);
         assert_eq!(parse_id("vikunja://other/42", TASK_URI_PREFIX), None);
+    }
+
+    #[test]
+    fn parse_filter_tasks_id_accepts_only_positive_filter_task_uris() {
+        assert_eq!(parse_filter_tasks_id("vikunja://filters/9/tasks"), Some(9));
+        assert_eq!(parse_filter_tasks_id("vikunja://filters/9"), None);
+        assert_eq!(parse_filter_tasks_id("vikunja://filters/0/tasks"), None);
+        assert_eq!(parse_filter_tasks_id("vikunja://filters/-2/tasks"), None);
+        assert_eq!(parse_filter_tasks_id("vikunja://filters/abc/tasks"), None);
+        assert_eq!(parse_filter_tasks_id("vikunja://tasks/9/tasks"), None);
+    }
+
+    #[test]
+    fn filter_uris_do_not_collide_with_id_template() {
+        // The /tasks suffix must not parse as a plain filter id.
+        assert_eq!(
+            parse_id("vikunja://filters/9/tasks", FILTER_URI_PREFIX),
+            None
+        );
+        assert_eq!(parse_id("vikunja://filters/9", FILTER_URI_PREFIX), Some(9));
     }
 
     #[test]

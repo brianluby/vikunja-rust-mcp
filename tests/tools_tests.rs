@@ -93,6 +93,12 @@ const EXPECTED_TOOLS: &[&str] = &[
     "vikunja_task_attachments_delete",
     "vikunja_users_search",
     "vikunja_teams_list",
+    "vikunja_filters_list",
+    "vikunja_filters_get",
+    "vikunja_filters_create",
+    "vikunja_filters_update",
+    "vikunja_filters_delete",
+    "vikunja_filters_tasks",
     "vikunja_dates_resolve",
 ];
 
@@ -1593,7 +1599,7 @@ async fn resources_are_listed_and_readable() {
     assert!(uris.contains(&"vikunja://tasks"));
 
     let templates = client.list_resource_templates(None).await.unwrap();
-    assert_eq!(templates.resource_templates.len(), 2);
+    assert_eq!(templates.resource_templates.len(), 4);
 
     // Status resource: reports config without leaking the token.
     let status = client
@@ -2389,6 +2395,356 @@ async fn malformed_template_ids_are_not_found() {
             "{uri}"
         );
     }
+    client.cancel().await.unwrap();
+}
+
+// ----- saved filters ------------------------------------------------------------
+
+fn saved_filter_json(id: i64, title: &str, filter: &str) -> serde_json::Value {
+    json!({
+        "id": id, "title": title, "description": "open work",
+        "filters": {
+            "sort_by": ["due_date", "id"],
+            "order_by": ["asc", "desc"],
+            "filter": filter,
+            "filter_timezone": "America/Los_Angeles",
+            "filter_include_nulls": false
+        },
+        "owner": {"id": 1, "username": "ada"},
+        "is_favorite": false,
+        "created": "2026-01-01T00:00:00Z", "updated": "2026-01-02T00:00:00Z"
+    })
+}
+
+#[tokio::test]
+async fn filters_crud_round_trips() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/filters"))
+        .and(body_json(json!({
+            "title": "Open work",
+            "filters": {"filter": "done = false", "sort_by": ["due_date"], "order_by": ["asc"]}
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Renamed",
+            "done = false",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"message": "Successfully deleted."})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let created = call(
+        &client,
+        "vikunja_filters_create",
+        json!({
+            "title": "Open work", "filter": "done = false",
+            "sort_by": ["due_date"], "order_by": ["asc"]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured(&created)["id"], 9);
+
+    let fetched = call(&client, "vikunja_filters_get", json!({"filter_id": 9}))
+        .await
+        .unwrap();
+    let body = structured(&fetched);
+    assert_eq!(body["title"], "Open work");
+    assert_eq!(body["filters"]["filter"], "done = false");
+
+    let updated = call(
+        &client,
+        "vikunja_filters_update",
+        json!({"filter_id": 9, "title": "Renamed"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured(&updated)["title"], "Renamed");
+
+    let deleted = call(&client, "vikunja_filters_delete", json!({"filter_id": 9}))
+        .await
+        .unwrap();
+    assert_eq!(structured(&deleted)["ok"], true);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn filters_list_derives_from_pseudo_projects() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 1, "title": "Inbox"},
+            {"id": -2, "title": "Open work", "description": "open", "is_favorite": true},
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(&client, "vikunja_filters_list", json!({}))
+        .await
+        .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["filters"].as_array().unwrap().len(), 1);
+    assert_eq!(body["filters"][0]["filter_id"], 1);
+    assert_eq!(body["filters"][0]["pseudo_project_id"], -2);
+    assert_eq!(body["filters"][0]["title"], "Open work");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn filters_tasks_executes_stored_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("filter", "done = false"))
+        .and(query_param("sort_by", "due_date"))
+        .and(query_param("order_by", "asc"))
+        .and(query_param("filter_timezone", "America/Los_Angeles"))
+        .and(query_param("filter_include_nulls", "false"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 4, "title": "Pay rent", "project_id": 1}]))
+                .insert_header("x-pagination-total-pages", "1")
+                .insert_header("x-pagination-result-count", "1"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(&client, "vikunja_filters_tasks", json!({"filter_id": 9}))
+        .await
+        .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["filter_id"], 9);
+    assert_eq!(body["title"], "Open work");
+    assert_eq!(body["filter"], "done = false");
+    assert_eq!(body["tasks"][0]["title"], "Pay rent");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn filters_validation_rejects_bad_arguments_before_any_request() {
+    // Unreachable address: a request would fail loudly, proving validation
+    // rejected the call first.
+    let client = connect("http://127.0.0.1:1").await;
+    let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+        (
+            "vikunja_filters_create",
+            json!({"title": "   ", "filter": "done = false"}),
+            "title",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({"title": "Open", "filter": "   "}),
+            "filter",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({"title": "Open", "filter": "(done = false"}),
+            "parenthes",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({"title": "Open", "filter": "done = false)"}),
+            "parenthes",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({"title": "Open", "filter": "title ~ 'unterminated"}),
+            "quote",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({
+                "title": "Open", "filter": "done = false",
+                "sort_by": ["due_date", "id"], "order_by": ["asc"]
+            }),
+            "same number",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({
+                "title": "Open", "filter": "done = false",
+                "sort_by": ["due_date"], "order_by": ["upward"]
+            }),
+            "'asc' or 'desc'",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({"title": "Open", "filter": "done = false", "filter_timezone": "  "}),
+            "filter_timezone",
+        ),
+        ("vikunja_filters_get", json!({"filter_id": 0}), "positive"),
+        (
+            "vikunja_filters_update",
+            json!({"filter_id": 9, "filter": "((done = false)"}),
+            "parenthes",
+        ),
+        (
+            "vikunja_filters_update",
+            json!({"filter_id": 9}),
+            "nothing to update",
+        ),
+        (
+            "vikunja_filters_delete",
+            json!({"filter_id": -3}),
+            "positive",
+        ),
+        (
+            "vikunja_filters_tasks",
+            json!({"filter_id": 9, "page": 0}),
+            "page",
+        ),
+    ];
+    for (tool, args, expected) in cases {
+        let err = call(&client, tool, args.clone()).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error for {tool} {args}");
+        };
+        assert!(
+            data.message.contains(expected),
+            "{tool} {args}: expected '{expected}' in '{}'",
+            data.message
+        );
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn filter_resources_are_listed_and_readable() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([
+                    {"id": 1, "title": "Inbox"},
+                    {"id": -10, "title": "Open work"},
+                ]))
+                .insert_header("x-pagination-total-pages", "1"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("filter", "done = false"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 4, "title": "Pay rent", "project_id": 1}]))
+                .insert_header("x-pagination-total-pages", "1"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let resources = client.list_resources(None).await.unwrap();
+    let uris: Vec<&str> = resources
+        .resources
+        .iter()
+        .map(|r| r.raw.uri.as_str())
+        .collect();
+    assert!(uris.contains(&"vikunja://filters"));
+
+    let templates = client.list_resource_templates(None).await.unwrap();
+    let template_uris: Vec<&str> = templates
+        .resource_templates
+        .iter()
+        .map(|t| t.raw.uri_template.as_str())
+        .collect();
+    assert!(template_uris.contains(&"vikunja://filters/{id}"));
+    assert!(template_uris.contains(&"vikunja://filters/{id}/tasks"));
+
+    // Saved filter list resource (from pseudo-projects).
+    let list = client
+        .read_resource(ReadResourceRequestParams::new("vikunja://filters"))
+        .await
+        .unwrap();
+    let ResourceContents::TextResourceContents { text, .. } = &list.contents[0] else {
+        panic!("expected text contents");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["count"], 1);
+    assert_eq!(parsed["filters"][0]["filter_id"], 9);
+    assert_eq!(parsed["filters"][0]["pseudo_project_id"], -10);
+
+    // One saved filter definition.
+    let one = client
+        .read_resource(ReadResourceRequestParams::new("vikunja://filters/9"))
+        .await
+        .unwrap();
+    let ResourceContents::TextResourceContents { text, .. } = &one.contents[0] else {
+        panic!("expected text contents");
+    };
+    assert!(text.contains("done = false"));
+
+    // Tasks matching the saved filter.
+    let tasks = client
+        .read_resource(ReadResourceRequestParams::new("vikunja://filters/9/tasks"))
+        .await
+        .unwrap();
+    let ResourceContents::TextResourceContents { text, .. } = &tasks.contents[0] else {
+        panic!("expected text contents");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["filter_id"], 9);
+    assert_eq!(parsed["filter"], "done = false");
+    assert_eq!(parsed["count"], 1);
+    assert_eq!(parsed["tasks"][0]["title"], "Pay rent");
+
     client.cancel().await.unwrap();
 }
 

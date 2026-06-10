@@ -8,9 +8,10 @@ use std::time::Duration;
 use common::{TEST_TOKEN, test_client, test_client_with_timeout};
 use serde_json::json;
 use vikunja_rust_mcp::error::{ApiErrorKind, Error};
-use vikunja_rust_mcp::vikunja::client::TaskListOptions;
+use vikunja_rust_mcp::vikunja::client::{TaskListOptions, saved_filter_options};
 use vikunja_rust_mcp::vikunja::models::{
-    LabelCreate, LabelUpdate, ProjectCreate, ProjectUpdate, RelationKind, TaskCreate, TaskUpdate,
+    LabelCreate, LabelUpdate, ProjectCreate, ProjectUpdate, RelationKind, SavedFilter,
+    SavedFilterCreate, SavedFilterQuery, SavedFilterUpdate, TaskCreate, TaskUpdate,
 };
 use vikunja_rust_mcp::vikunja::pagination::PageParams;
 use wiremock::matchers::{body_json, body_string_contains, header, method, path, query_param};
@@ -1147,6 +1148,224 @@ async fn probe_reports_success_status() {
 
     let client = test_client(&server.uri());
     assert_eq!(client.probe().await.unwrap().as_u16(), 200);
+}
+
+// ----- saved filters ----------------------------------------------------------
+
+fn saved_filter_json(id: i64, title: &str, filter: &str) -> serde_json::Value {
+    json!({
+        "id": id, "title": title, "description": "open work",
+        "filters": {
+            "sort_by": ["due_date", "id"],
+            "order_by": ["asc", "desc"],
+            "filter": filter,
+            "filter_timezone": "America/Los_Angeles",
+            "filter_include_nulls": false
+        },
+        "owner": {"id": 1, "username": "ada"},
+        "is_favorite": true,
+        "created": "2026-01-01T00:00:00Z", "updated": "2026-01-02T00:00:00Z"
+    })
+}
+
+#[tokio::test]
+async fn get_saved_filter_decodes_definition() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let filter = client.get_saved_filter(9).await.unwrap();
+    assert_eq!(filter.id, 9);
+    assert_eq!(filter.title, "Open work");
+    assert!(filter.is_favorite);
+    let query = filter.filters.unwrap();
+    assert_eq!(query.filter.as_deref(), Some("done = false"));
+    assert_eq!(
+        query.sort_by.as_deref(),
+        Some(["due_date".to_string(), "id".to_string()].as_slice())
+    );
+    assert_eq!(
+        query.filter_timezone.as_deref(),
+        Some("America/Los_Angeles")
+    );
+    assert_eq!(query.filter_include_nulls, Some(false));
+}
+
+#[tokio::test]
+async fn create_saved_filter_puts_only_set_fields() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/filters"))
+        .and(body_json(json!({
+            "title": "Open work",
+            "filters": {"filter": "done = false"}
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let body = SavedFilterCreate {
+        title: "Open work".into(),
+        filters: SavedFilterQuery {
+            filter: Some("done = false".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let filter = client.create_saved_filter(&body).await.unwrap();
+    assert_eq!(filter.id, 9);
+}
+
+#[tokio::test]
+async fn update_saved_filter_merges_top_level_and_nested_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The merged write must keep the stored title, sort order and timezone
+    // while replacing only the filter expression.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/filters/9"))
+        .and(body_string_contains("\"title\":\"Open work\""))
+        .and(body_string_contains("\"filter\":\"priority >= 3\""))
+        .and(body_string_contains(
+            "\"filter_timezone\":\"America/Los_Angeles\"",
+        ))
+        .and(body_string_contains("\"due_date\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "priority >= 3",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let patch = SavedFilterUpdate {
+        filters: Some(SavedFilterQuery {
+            filter: Some("priority >= 3".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let updated = client.update_saved_filter(9, &patch).await.unwrap();
+    let query = updated.filters.unwrap();
+    assert_eq!(query.filter.as_deref(), Some("priority >= 3"));
+}
+
+#[tokio::test]
+async fn update_saved_filter_rejects_empty_patch() {
+    let client = test_client("http://127.0.0.1:1");
+    let err = client
+        .update_saved_filter(9, &SavedFilterUpdate::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)));
+}
+
+#[tokio::test]
+async fn delete_saved_filter_returns_message() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"message": "Successfully deleted."})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let message = client.delete_saved_filter(9).await.unwrap();
+    assert_eq!(message.message, "Successfully deleted.");
+}
+
+#[tokio::test]
+async fn list_saved_filters_derives_from_pseudo_projects() {
+    let server = MockServer::start().await;
+    // Vikunja reports saved filters inside the project list as
+    // pseudo-projects with ids <= -2 (filter id = -project_id - 1).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            project_json(1, "Inbox"),
+            project_json(-2, "Open work"),
+            project_json(-3, "This week"),
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let filters = client.list_saved_filters(10).await.unwrap();
+    assert_eq!(filters.len(), 2);
+    assert_eq!(filters[0].filter_id, 1);
+    assert_eq!(filters[0].pseudo_project_id, -2);
+    assert_eq!(filters[0].title, "Open work");
+    assert_eq!(filters[1].filter_id, 2);
+    assert_eq!(filters[1].pseudo_project_id, -3);
+}
+
+#[tokio::test]
+async fn saved_filter_options_maps_stored_query() {
+    let filter: SavedFilter =
+        serde_json::from_value(saved_filter_json(9, "Open work", "done = false")).unwrap();
+    let options = saved_filter_options(&filter);
+    assert_eq!(options.filter.as_deref(), Some("done = false"));
+    // Only the first sort pair maps onto /tasks, which takes one of each.
+    assert_eq!(options.sort_by.as_deref(), Some("due_date"));
+    assert_eq!(options.order_by.as_deref(), Some("asc"));
+    assert_eq!(
+        options.filter_timezone.as_deref(),
+        Some("America/Los_Angeles")
+    );
+    assert_eq!(options.filter_include_nulls, Some(false));
+}
+
+#[tokio::test]
+async fn list_tasks_sends_timezone_and_include_nulls() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("filter", "done = false"))
+        .and(query_param("filter_timezone", "America/Los_Angeles"))
+        .and(query_param("filter_include_nulls", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let options = TaskListOptions {
+        filter: Some("done = false".into()),
+        filter_timezone: Some("America/Los_Angeles".into()),
+        filter_include_nulls: Some(true),
+        ..Default::default()
+    };
+    client.list_tasks(&options).await.unwrap();
 }
 
 // ----- task relations ---------------------------------------------------------

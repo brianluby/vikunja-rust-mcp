@@ -22,8 +22,8 @@ use crate::error::Error;
 
 use super::models::{
     Label, LabelCreate, LabelTask, LabelUpdate, Message, Project, ProjectCreate, ProjectUpdate,
-    RelationKind, Task, TaskAssignee, TaskComment, TaskCreate, TaskRelation, TaskUpdate, Team,
-    User,
+    RelationKind, SavedFilter, SavedFilterCreate, SavedFilterSummary, SavedFilterUpdate, Task,
+    TaskAssignee, TaskComment, TaskCreate, TaskRelation, TaskUpdate, Team, User,
 };
 use super::pagination::{Page, PageInfo, PageParams};
 
@@ -45,6 +45,10 @@ pub struct TaskListOptions {
     pub sort_by: Option<String>,
     /// Sort direction: `asc` or `desc`.
     pub order_by: Option<String>,
+    /// IANA timezone used to resolve relative dates like `now/d`.
+    pub filter_timezone: Option<String>,
+    /// Whether tasks with a null value in a filtered field match.
+    pub filter_include_nulls: Option<bool>,
 }
 
 impl TaskListOptions {
@@ -58,6 +62,22 @@ impl TaskListOptions {
             (None, Some(project_id)) => Some(format!("project_id = {project_id}")),
             (None, None) => None,
         }
+    }
+}
+
+/// Builds task-listing options that evaluate a saved filter's stored query:
+/// the filter expression, timezone and null handling carry over directly,
+/// and the first `sort_by`/`order_by` pair is applied (the `/tasks` endpoint
+/// this server queries takes one of each).
+pub fn saved_filter_options(filter: &SavedFilter) -> TaskListOptions {
+    let query = filter.filters.as_ref();
+    TaskListOptions {
+        filter: query.and_then(|q| q.filter.clone()),
+        sort_by: query.and_then(|q| q.sort_by.as_ref()?.first().cloned()),
+        order_by: query.and_then(|q| q.order_by.as_ref()?.first().cloned()),
+        filter_timezone: query.and_then(|q| q.filter_timezone.clone()),
+        filter_include_nulls: query.and_then(|q| q.filter_include_nulls),
+        ..Default::default()
     }
 }
 
@@ -398,6 +418,12 @@ impl VikunjaClient {
         }
         if let Some(order_by) = options.order_by.as_deref() {
             query.push(("order_by", order_by.to_string()));
+        }
+        if let Some(timezone) = options.filter_timezone.as_deref() {
+            query.push(("filter_timezone", timezone.to_string()));
+        }
+        if let Some(include_nulls) = options.filter_include_nulls {
+            query.push(("filter_include_nulls", include_nulls.to_string()));
         }
         self.get_page(
             "tasks.list",
@@ -864,6 +890,105 @@ impl VikunjaClient {
             &format!("/projects/{project_id}/teams"),
             &query,
             params,
+        )
+        .await
+    }
+
+    // ----- Saved filters ------------------------------------------------------
+
+    /// Lists saved filters. Vikunja has no `GET /filters` endpoint: each
+    /// saved filter appears in `GET /projects` as a pseudo-project with id
+    /// `-filter_id - 1`, so this walks the project list (bounded by
+    /// `max_pages`) and keeps the pseudo-project entries.
+    pub async fn list_saved_filters(
+        &self,
+        max_pages: u32,
+    ) -> Result<Vec<SavedFilterSummary>, Error> {
+        let projects = self.list_all_projects(max_pages).await?;
+        Ok(projects
+            .iter()
+            .filter_map(SavedFilterSummary::from_project)
+            .collect())
+    }
+
+    /// `GET /filters/{id}`.
+    pub async fn get_saved_filter(&self, filter_id: i64) -> Result<SavedFilter, Error> {
+        self.get_json("filters.get", &format!("/filters/{filter_id}"), &[])
+            .await
+    }
+
+    /// `PUT /filters` — create a saved filter.
+    pub async fn create_saved_filter(
+        &self,
+        body: &SavedFilterCreate,
+    ) -> Result<SavedFilter, Error> {
+        self.send_json("filters.create", Method::PUT, "/filters", body)
+            .await
+    }
+
+    /// `POST /filters/{id}` — partial update via read-merge-write. Unlike
+    /// the generic merge, the nested `filters` query is merged field by
+    /// field so that e.g. changing only the filter expression keeps the
+    /// stored sort order and timezone.
+    pub async fn update_saved_filter(
+        &self,
+        filter_id: i64,
+        patch: &SavedFilterUpdate,
+    ) -> Result<SavedFilter, Error> {
+        if patch.title.is_none()
+            && patch.description.is_none()
+            && patch.is_favorite.is_none()
+            && patch.filters.is_none()
+        {
+            return Err(Error::InvalidArgument(
+                "nothing to update: provide at least one field".to_string(),
+            ));
+        }
+
+        let mut current = self.get_saved_filter(filter_id).await?;
+        if let Some(title) = &patch.title {
+            current.title = title.clone();
+        }
+        if let Some(description) = &patch.description {
+            current.description = description.clone();
+        }
+        if let Some(is_favorite) = patch.is_favorite {
+            current.is_favorite = is_favorite;
+        }
+        if let Some(query_patch) = &patch.filters {
+            let query = current.filters.get_or_insert_with(Default::default);
+            if let Some(filter) = &query_patch.filter {
+                query.filter = Some(filter.clone());
+            }
+            if let Some(sort_by) = &query_patch.sort_by {
+                query.sort_by = Some(sort_by.clone());
+            }
+            if let Some(order_by) = &query_patch.order_by {
+                query.order_by = Some(order_by.clone());
+            }
+            if let Some(timezone) = &query_patch.filter_timezone {
+                query.filter_timezone = Some(timezone.clone());
+            }
+            if let Some(include_nulls) = query_patch.filter_include_nulls {
+                query.filter_include_nulls = Some(include_nulls);
+            }
+        }
+
+        self.send_json(
+            "filters.update",
+            Method::POST,
+            &format!("/filters/{filter_id}"),
+            &current,
+        )
+        .await
+    }
+
+    /// `DELETE /filters/{id}`.
+    pub async fn delete_saved_filter(&self, filter_id: i64) -> Result<Message, Error> {
+        self.send_empty(
+            "filters.delete",
+            Method::DELETE,
+            &format!("/filters/{filter_id}"),
         )
         .await
     }

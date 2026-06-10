@@ -165,6 +165,12 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_task_attachments_delete` | Delete an attachment. |
 | `vikunja_users_search` | Search users (for assignment). |
 | `vikunja_teams_list` | List teams; with `project_id`, list the teams that can access that project including their permission level. |
+| `vikunja_filters_list` | List saved filters (durable, named task queries). |
+| `vikunja_filters_get` | Get one saved filter incl. its stored query. |
+| `vikunja_filters_create` | Create a saved filter from a filter expression + sort order. |
+| `vikunja_filters_update` | Partially update a saved filter (query merged field by field). |
+| `vikunja_filters_delete` | Delete a saved filter (tasks are unaffected). |
+| `vikunja_filters_tasks` | List the tasks a saved filter currently matches (paginated). |
 | `vikunja_dates_resolve` | Preview how a date shortcut resolves to RFC 3339 (read-only, never calls Vikunja). |
 
 List tools return `{ items..., "pagination": { page, per_page, total_pages,
@@ -268,8 +274,11 @@ The `*_bulk_*` tools are deliberately conservative:
 | `vikunja://tasks/high-priority` | Open tasks with priority >= 3 (task view). |
 | `vikunja://tasks/inbox` | Open tasks without a due date (task view). |
 | `vikunja://tasks/recently-updated` | All tasks, most recently updated first (task view). |
+| `vikunja://filters` | All saved filters, with their filter ids and pseudo-project ids. |
 | `vikunja://projects/{id}` | One project (resource template). |
 | `vikunja://tasks/{id}` | One task (resource template). |
+| `vikunja://filters/{id}` | One saved filter incl. its stored query (resource template). |
+| `vikunja://filters/{id}/tasks` | Tasks matching a saved filter (resource template, capped at 10 pages). |
 
 ### Task view resources
 
@@ -321,6 +330,37 @@ pages. The JSON body embeds the view definition and pagination metadata:
 reported more pages. Every view can be replicated (and customized, e.g.
 restricted to one project or paginated past the cap) by calling the
 `vikunja_tasks_list` tool with the same `filter`, `sort_by` and `order_by`.
+
+### Saved filters
+
+Saved filters are durable, named task queries stored in Vikunja itself —
+unlike the fixed task views above, users define and edit them. A few
+Vikunja quirks this server hides:
+
+- **Filters look like projects.** Vikunja has no `GET /filters` list
+  endpoint; each saved filter instead appears in the project list as a
+  pseudo-project with the negative id `-filter_id - 1` (filter 1 is
+  project `-2`). `vikunja_filters_list` and `vikunja://filters` resolve
+  that mapping and report both ids; the filter tools always take the
+  positive `filter_id`. Expect these pseudo-projects to also show up in
+  `vikunja_projects_list` output.
+- **Task results are computed via `GET /tasks`.** `vikunja_filters_tasks`
+  and `vikunja://filters/{id}/tasks` fetch the saved filter and evaluate
+  its stored query through the regular task listing: the filter
+  expression, `filter_timezone` and `filter_include_nulls` carry over
+  directly, and the **first** stored `sort_by`/`order_by` pair is applied
+  (the task listing takes one sort field). Secondary sort keys stored on
+  the filter are not applied.
+- **Updates merge field by field.** Changing only the filter expression
+  keeps the stored sort order, timezone and null handling; top-level
+  fields behave like every other update tool (read-merge-write).
+- **Validation is syntactic.** Empty titles, empty filter expressions,
+  unbalanced parentheses and unterminated quotes are rejected before any
+  write; full filter grammar errors are reported by Vikunja itself and
+  surface as validation errors.
+- A saved filter's relative dates (e.g. `now/d`) are resolved using the
+  filter's stored `filter_timezone`; if none is stored, the Vikunja
+  server's timezone applies.
 
 ## Error handling
 
@@ -403,10 +443,12 @@ entities (cleanup is best-effort).
 
 - **Pre-1.0 instances:** Vikunja < 1.0 used `GET /tasks/all`; this server
   targets the current stable API (`GET /tasks`).
-- **Kanban views/buckets, saved filters, reminders as first-class tools,
-  reactions, link/user shares, webhooks, notifications, migrations**: out of
-  scope for the core resource set this server exposes. Reminders still
-  appear in task JSON where Vikunja returns them.
+- **Kanban views/buckets, reminders as first-class tools, reactions,
+  link/user shares, webhooks, notifications, migrations**: out of scope
+  for the core resource set this server exposes. Reminders still appear in
+  task JSON where Vikunja returns them. (Saved filters and task relations
+  *are* supported — see the `vikunja_filters_*` and
+  `vikunja_task_relations_*` tools.)
 - **Vikunja's native bulk endpoints** (`/tasks/bulk`, label/assignee bulk):
   not used. Bulk task operations *are* available as the `*_bulk_*` tools
   above, but they fan out over the same per-task endpoints as the
