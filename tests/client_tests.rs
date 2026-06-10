@@ -1531,6 +1531,91 @@ async fn get_task_decodes_related_tasks() {
     assert_eq!(related["blocking"][0].id, 9);
 }
 
+// ----- project views & kanban buckets -------------------------------------------
+
+fn view_json(id: i64, title: &str, kind: &str) -> serde_json::Value {
+    json!({
+        "id": id, "title": title, "project_id": 7, "view_kind": kind,
+        "position": 100, "default_bucket_id": 0, "done_bucket_id": 0,
+        "created": "2026-01-01T00:00:00Z", "updated": "2026-01-01T00:00:00Z"
+    })
+}
+
+#[tokio::test]
+async fn list_project_views_decodes_kinds() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            view_json(1, "List", "list"),
+            view_json(4, "Kanban", "kanban"),
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let page = client
+        .list_project_views(7, PageParams::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].view_kind, "list");
+    assert_eq!(page.items[1].view_kind, "kanban");
+    assert_eq!(page.items[1].id, 4);
+    assert_eq!(page.items[1].title, "Kanban");
+}
+
+#[tokio::test]
+async fn list_view_buckets_decodes_buckets_with_tasks() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views/4/buckets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": 1, "title": "Backlog", "project_view_id": 4,
+                "limit": 0, "count": 1, "position": 100,
+                "tasks": [task_json(11, "Plan the thing", false)]
+            },
+            {
+                "id": 2, "title": "Doing", "project_view_id": 4,
+                "limit": 3, "count": 0, "position": 200,
+                "tasks": null
+            },
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let page = client
+        .list_view_buckets(7, 4, PageParams::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].title, "Backlog");
+    assert_eq!(page.items[0].tasks.as_ref().unwrap()[0].id, 11);
+    assert_eq!(page.items[1].title, "Doing");
+    assert_eq!(page.items[1].limit, 3);
+    assert!(page.items[1].tasks.is_none());
+}
+
+#[tokio::test]
+async fn task_with_bucket_id_round_trips() {
+    let server = MockServer::start().await;
+    let mut with_bucket = task_json(11, "On the board", false);
+    with_bucket["bucket_id"] = json!(2);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/11"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(with_bucket))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let task = client.get_task(11).await.unwrap();
+    assert_eq!(task.bucket_id, Some(2));
+}
+
 // ----- task reminders -----------------------------------------------------------
 
 #[tokio::test]

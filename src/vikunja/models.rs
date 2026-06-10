@@ -197,6 +197,93 @@ pub struct Task {
     /// Reminders attached to the task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminders: Option<Vec<TaskReminder>>,
+    /// Id of the Kanban bucket the task sits in, when the API reports it.
+    /// Resolve bucket names with the bucket listing for the project's
+    /// kanban view. Absent (and omitted from output) when Vikunja does not
+    /// send it or sends 0.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nonzero_id"
+    )]
+    pub bucket_id: Option<i64>,
+}
+
+/// A project view (`models.ProjectView`): one way of looking at a project's
+/// tasks. Kanban boards are views with `view_kind == "kanban"`; their lanes
+/// are buckets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectView {
+    pub id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub project_id: i64,
+    /// View kind as reported by Vikunja: `list`, `gantt`, `table` or
+    /// `kanban`. Kept as a string so new kinds do not break decoding.
+    #[serde(default)]
+    pub view_kind: String,
+    #[serde(default)]
+    pub position: f64,
+    /// Bucket new tasks land in by default (kanban views; 0 when unset).
+    #[serde(default)]
+    pub default_bucket_id: i64,
+    /// Bucket whose tasks are treated as done (kanban views; 0 when unset).
+    #[serde(default)]
+    pub done_bucket_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+impl ProjectView {
+    /// The `view_kind` value of kanban views.
+    pub const KANBAN_KIND: &'static str = "kanban";
+
+    /// True when this view is a Kanban board.
+    pub fn is_kanban(&self) -> bool {
+        self.view_kind == Self::KANBAN_KIND
+    }
+}
+
+/// A Kanban bucket (`models.Bucket`): one lane of a kanban view, including
+/// the tasks currently placed in it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Bucket {
+    pub id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub project_view_id: i64,
+    /// Maximum number of tasks allowed in the bucket; 0 means no limit.
+    #[serde(default)]
+    pub limit: i64,
+    /// Number of tasks in the bucket as counted by the server.
+    #[serde(default)]
+    pub count: i64,
+    #[serde(default)]
+    pub position: f64,
+    /// Tasks currently in this bucket (one page per bucket).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Vec<Task>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<User>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+/// Accepts an id that Vikunja reports as 0 when unset. Only positive ids
+/// are kept: 0 means unset and bucket ids are never negative, so anything
+/// else maps to `None`.
+fn deserialize_nonzero_id<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let id = Option::<i64>::deserialize(deserializer)?;
+    Ok(id.filter(|id| *id > 0))
 }
 
 /// A task reminder (`models.TaskReminder`): either an absolute `reminder`
@@ -925,6 +1012,72 @@ mod tests {
         let real: Project =
             serde_json::from_value(serde_json::json!({"id": 3, "title": "Inbox"})).unwrap();
         assert!(SavedFilterSummary::from_project(&real).is_none());
+    }
+
+    #[test]
+    fn project_view_decodes_and_detects_kanban() {
+        let view: ProjectView = serde_json::from_value(serde_json::json!({
+            "id": 4, "title": "Kanban", "project_id": 7, "view_kind": "kanban",
+            "position": 100, "default_bucket_id": 1, "done_bucket_id": 3,
+            "bucket_configuration_mode": "manual", "some_future_field": true
+        }))
+        .unwrap();
+        assert!(view.is_kanban());
+        assert_eq!(view.default_bucket_id, 1);
+        assert_eq!(view.done_bucket_id, 3);
+
+        let list: ProjectView = serde_json::from_value(serde_json::json!({
+            "id": 1, "title": "List", "view_kind": "list"
+        }))
+        .unwrap();
+        assert!(!list.is_kanban());
+    }
+
+    #[test]
+    fn bucket_round_trips_with_and_without_tasks() {
+        let bucket: Bucket = serde_json::from_value(serde_json::json!({
+            "id": 2, "title": "Doing", "project_view_id": 4,
+            "limit": 3, "count": 1, "position": 200,
+            "tasks": [{"id": 11, "title": "On it"}]
+        }))
+        .unwrap();
+        assert_eq!(bucket.title, "Doing");
+        assert_eq!(bucket.limit, 3);
+        assert_eq!(bucket.tasks.as_ref().unwrap()[0].id, 11);
+        let back: Bucket = serde_json::from_value(serde_json::to_value(&bucket).unwrap()).unwrap();
+        assert_eq!(back, bucket);
+
+        let empty: Bucket = serde_json::from_value(serde_json::json!({
+            "id": 3, "title": "Done", "tasks": null
+        }))
+        .unwrap();
+        assert!(empty.tasks.is_none());
+    }
+
+    #[test]
+    fn task_bucket_id_treats_zero_as_unset() {
+        let on_board: Task =
+            serde_json::from_value(serde_json::json!({"id": 1, "title": "t", "bucket_id": 2}))
+                .unwrap();
+        assert_eq!(on_board.bucket_id, Some(2));
+
+        let zero: Task =
+            serde_json::from_value(serde_json::json!({"id": 1, "title": "t", "bucket_id": 0}))
+                .unwrap();
+        assert_eq!(zero.bucket_id, None);
+
+        // Bucket ids are never negative; a corrupted value maps to unset.
+        let negative: Task =
+            serde_json::from_value(serde_json::json!({"id": 1, "title": "t", "bucket_id": -2}))
+                .unwrap();
+        assert_eq!(negative.bucket_id, None);
+
+        let absent: Task =
+            serde_json::from_value(serde_json::json!({"id": 1, "title": "t"})).unwrap();
+        assert_eq!(absent.bucket_id, None);
+        // Backward compatible output: unset bucket_id is omitted entirely.
+        let value = serde_json::to_value(&absent).unwrap();
+        assert!(value.get("bucket_id").is_none());
     }
 
     #[test]

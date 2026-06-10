@@ -102,6 +102,8 @@ const EXPECTED_TOOLS: &[&str] = &[
     "vikunja_filters_update",
     "vikunja_filters_delete",
     "vikunja_filters_tasks",
+    "vikunja_project_views_list",
+    "vikunja_buckets_list",
     "vikunja_dates_resolve",
 ];
 
@@ -1602,7 +1604,7 @@ async fn resources_are_listed_and_readable() {
     assert!(uris.contains(&"vikunja://tasks"));
 
     let templates = client.list_resource_templates(None).await.unwrap();
-    assert_eq!(templates.resource_templates.len(), 4);
+    assert_eq!(templates.resource_templates.len(), 5);
 
     // Status resource: reports config without leaking the token.
     let status = client
@@ -3360,6 +3362,202 @@ async fn one_page_lists_omit_auto_pagination_metadata() {
         body.get("auto_pagination").is_none(),
         "one-page responses must not grow an auto_pagination block: {body}"
     );
+    client.cancel().await.unwrap();
+}
+
+// ----- kanban buckets -------------------------------------------------------------
+
+fn buckets_json() -> serde_json::Value {
+    json!([
+        {
+            "id": 1, "title": "Backlog", "project_view_id": 4,
+            "limit": 0, "count": 1, "position": 100,
+            "tasks": [{"id": 11, "title": "Plan the thing", "project_id": 7, "bucket_id": 1}]
+        },
+        {
+            "id": 2, "title": "Doing", "project_view_id": 4,
+            "limit": 3, "count": 1, "position": 200,
+            "tasks": [{"id": 12, "title": "Build the thing", "project_id": 7, "bucket_id": 2}]
+        },
+    ])
+}
+
+fn views_json() -> serde_json::Value {
+    json!([
+        {"id": 1, "title": "List", "project_id": 7, "view_kind": "list"},
+        {"id": 4, "title": "Kanban", "project_id": 7, "view_kind": "kanban",
+         "default_bucket_id": 1, "done_bucket_id": 2},
+    ])
+}
+
+#[tokio::test]
+async fn project_views_list_returns_views() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(views_json()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_project_views_list",
+        json!({"project_id": 7}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["views"].as_array().unwrap().len(), 2);
+    assert_eq!(body["views"][1]["view_kind"], "kanban");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn buckets_list_resolves_kanban_view_automatically() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(views_json()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views/4/buckets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(buckets_json()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(&client, "vikunja_buckets_list", json!({"project_id": 7}))
+        .await
+        .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["project_id"], 7);
+    assert_eq!(body["view_id"], 4);
+    assert_eq!(body["view_title"], "Kanban");
+    let buckets = body["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(buckets[0]["title"], "Backlog");
+    assert_eq!(buckets[0]["is_default_bucket"], true);
+    assert_eq!(buckets[0]["is_done_bucket"], false);
+    assert_eq!(buckets[1]["title"], "Doing");
+    assert_eq!(buckets[1]["is_done_bucket"], true);
+    assert_eq!(buckets[1]["tasks"][0]["title"], "Build the thing");
+    assert_eq!(buckets[1]["tasks"][0]["bucket_id"], 2);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn buckets_list_uses_explicit_view_id_without_views_call() {
+    let server = MockServer::start().await;
+    // No /views mock: an explicit view_id must skip view resolution.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views/4/buckets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(buckets_json()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_buckets_list",
+        json!({"project_id": 7, "view_id": 4}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["view_id"], 4);
+    // Without the views listing the title and the done/default flags are
+    // unknown and omitted entirely (not reported as false).
+    assert!(body.get("view_title").is_none());
+    assert!(body["buckets"][1].get("is_done_bucket").is_none());
+    assert!(body["buckets"][1].get("is_default_bucket").is_none());
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn buckets_list_errors_when_project_has_no_kanban_view() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 1, "title": "List", "project_id": 7, "view_kind": "list"}
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let err = call(&client, "vikunja_buckets_list", json!({"project_id": 7}))
+        .await
+        .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("kanban"), "{}", data.message);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn bucket_tools_validate_ids_before_any_request() {
+    let client = connect("http://127.0.0.1:1").await;
+    for (tool, args) in [
+        ("vikunja_project_views_list", json!({"project_id": 0})),
+        ("vikunja_buckets_list", json!({"project_id": -7})),
+        (
+            "vikunja_buckets_list",
+            json!({"project_id": 7, "view_id": 0}),
+        ),
+    ] {
+        let err = call(&client, tool, args.clone()).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error for {tool} {args}");
+        };
+        assert!(data.message.contains("positive"), "{}", data.message);
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn buckets_resource_template_reads_project_buckets() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(views_json()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views/4/buckets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(buckets_json()))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let templates = client.list_resource_templates(None).await.unwrap();
+    let template_uris: Vec<&str> = templates
+        .resource_templates
+        .iter()
+        .map(|t| t.raw.uri_template.as_str())
+        .collect();
+    assert!(template_uris.contains(&"vikunja://projects/{id}/buckets"));
+
+    let result = client
+        .read_resource(ReadResourceRequestParams::new(
+            "vikunja://projects/7/buckets",
+        ))
+        .await
+        .unwrap();
+    let ResourceContents::TextResourceContents { text, .. } = &result.contents[0] else {
+        panic!("expected text contents");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["view_id"], 4);
+    assert_eq!(parsed["buckets"][1]["title"], "Doing");
     client.cancel().await.unwrap();
 }
 

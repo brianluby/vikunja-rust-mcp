@@ -21,9 +21,10 @@ use crate::config::Config;
 use crate::error::Error;
 
 use super::models::{
-    Label, LabelCreate, LabelTask, LabelUpdate, Message, Project, ProjectCreate, ProjectUpdate,
-    RelationKind, SavedFilter, SavedFilterCreate, SavedFilterSummary, SavedFilterUpdate, Task,
-    TaskAssignee, TaskComment, TaskCreate, TaskRelation, TaskReminder, TaskUpdate, Team, User,
+    Bucket, Label, LabelCreate, LabelTask, LabelUpdate, Message, Project, ProjectCreate,
+    ProjectUpdate, ProjectView, RelationKind, SavedFilter, SavedFilterCreate, SavedFilterSummary,
+    SavedFilterUpdate, Task, TaskAssignee, TaskComment, TaskCreate, TaskRelation, TaskReminder,
+    TaskUpdate, Team, User,
 };
 use super::pagination::{BoundedPage, Page, PageInfo, PageParams, walk_pages};
 
@@ -934,6 +935,42 @@ impl VikunjaClient {
             "teams.list_for_project",
             &format!("/projects/{project_id}/teams"),
             &query,
+            params,
+        )
+        .await
+    }
+
+    // ----- Project views & kanban buckets -------------------------------------
+
+    /// `GET /projects/{id}/views` — the views (list, gantt, table, kanban)
+    /// configured for a project.
+    pub async fn list_project_views(
+        &self,
+        project_id: i64,
+        params: PageParams,
+    ) -> Result<Page<ProjectView>, Error> {
+        self.get_page(
+            "views.list",
+            &format!("/projects/{project_id}/views"),
+            &[],
+            params,
+        )
+        .await
+    }
+
+    /// `GET /projects/{project}/views/{view}/buckets` — the buckets of a
+    /// kanban view, each including one page of its tasks. `per_page` bounds
+    /// the tasks returned per bucket.
+    pub async fn list_view_buckets(
+        &self,
+        project_id: i64,
+        view_id: i64,
+        params: PageParams,
+    ) -> Result<Page<Bucket>, Error> {
+        self.get_page(
+            "buckets.list",
+            &format!("/projects/{project_id}/views/{view_id}/buckets"),
+            &[],
             params,
         )
         .await

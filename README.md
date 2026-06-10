@@ -175,6 +175,8 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_filters_delete` | Delete a saved filter (tasks are unaffected). |
 | `vikunja_filters_tasks` | List the tasks a saved filter currently matches (paginated). |
 | `vikunja_dates_resolve` | Preview how a date shortcut resolves to RFC 3339 (read-only, never calls Vikunja). |
+| `vikunja_project_views_list` | List a project's views (list/gantt/table/kanban) with their ids. |
+| `vikunja_buckets_list` | List a project's Kanban buckets (lanes) with names and the tasks in each (read-only). |
 
 List tools return `{ items..., "pagination": { page, per_page, total_pages,
 result_count, has_more } }` built from Vikunja's `x-pagination-total-pages`
@@ -345,6 +347,7 @@ The `*_bulk_*` tools are deliberately conservative:
 | `vikunja://tasks/recently-updated` | All tasks, most recently updated first (task view). |
 | `vikunja://filters` | All saved filters, with their filter ids and pseudo-project ids. |
 | `vikunja://projects/{id}` | One project (resource template). |
+| `vikunja://projects/{id}/buckets` | Kanban buckets of a project's first kanban view, with their tasks (resource template). |
 | `vikunja://tasks/{id}` | One task (resource template). |
 | `vikunja://filters/{id}` | One saved filter incl. its stored query (resource template). |
 | `vikunja://filters/{id}/tasks` | Tasks matching a saved filter (resource template, capped at 10 pages). |
@@ -399,6 +402,32 @@ pages. The JSON body embeds the view definition and pagination metadata:
 reported more pages. Every view can be replicated (and customized, e.g.
 restricted to one project or paginated past the cap) by calling the
 `vikunja_tasks_list` tool with the same `filter`, `sort_by` and `order_by`.
+
+### Kanban buckets
+
+Vikunja organizes Kanban boards as *project views*: every project has a set
+of views (list, gantt, table, kanban), and the kanban view's lanes are
+*buckets* (e.g. Backlog, Doing, Done). Bucket support here is **read-only**
+and built for answering questions like "which tasks are in the Doing lane?"
+by name instead of by hidden numeric ids:
+
+- `vikunja_project_views_list` lists a project's views with their ids and
+  kinds.
+- `vikunja_buckets_list` (and the `vikunja://projects/{id}/buckets`
+  resource) lists the buckets of a kanban view with each bucket's name,
+  task-count, WIP `limit` (0 = none) and the tasks currently in it. Without
+  `view_id`, the project's **first kanban view** is used; pass `view_id` for
+  projects with several kanban views. When the view definition was fetched
+  (auto-resolution), each bucket also reports `is_default_bucket` /
+  `is_done_bucket`; with an explicit `view_id` those flags are unknown and
+  omitted from the output.
+- Task JSON includes `bucket_id` whenever Vikunja reports it (a `0`/absent
+  value is omitted), so bucket ids can be resolved to names via the bucket
+  listing. Existing task outputs are unchanged otherwise.
+
+Limitations: moving tasks between buckets and creating/renaming/deleting
+buckets are intentionally not exposed; the bucket listing returns one page
+of tasks per bucket (raise `per_page` to see more).
 
 ### Saved filters
 
@@ -512,12 +541,14 @@ entities (cleanup is best-effort).
 
 - **Pre-1.0 instances:** Vikunja < 1.0 used `GET /tasks/all`; this server
   targets the current stable API (`GET /tasks`).
-- **Kanban views/buckets, reminders as first-class tools, reactions,
-  link/user shares, webhooks, notifications, migrations**: out of scope
-  for the core resource set this server exposes. Reminders still appear in
-  task JSON where Vikunja returns them. (Saved filters and task relations
-  *are* supported — see the `vikunja_filters_*` and
-  `vikunja_task_relations_*` tools.)
+- **Reminders as first-class tools, reactions, link/user shares, webhooks,
+  notifications, migrations**: out of scope for the core resource set this
+  server exposes. Reminders still appear in task JSON where Vikunja returns
+  them. (Saved filters, task relations and read-only Kanban buckets *are*
+  supported — see the `vikunja_filters_*`, `vikunja_task_relations_*` and
+  `vikunja_buckets_list` tools.)
+- **Kanban bucket writes** (creating/renaming/deleting buckets, moving
+  tasks between buckets): bucket support is deliberately read-only.
 - **Vikunja's native bulk endpoints** (`/tasks/bulk`, label/assignee bulk):
   not used. Bulk task operations *are* available as the `*_bulk_*` tools
   above, but they fan out over the same per-task endpoints as the
