@@ -18,7 +18,7 @@ use crate::vikunja::client::{TaskListOptions, saved_filter_options};
 use crate::vikunja::models::{
     Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, RelationKind,
     SavedFilter, SavedFilterCreate, SavedFilterQuery, SavedFilterSummary, SavedFilterUpdate, Task,
-    TaskAttachment, TaskComment, TaskCreate, TaskRelation, TaskUpdate, Team, User,
+    TaskAttachment, TaskComment, TaskCreate, TaskRelation, TaskReminder, TaskUpdate, Team, User,
 };
 use crate::vikunja::pagination::{BoundedPage, PageInfo, PageParams, walk_pages};
 
@@ -361,6 +361,60 @@ pub struct TaskRelationArgs {
     pub relation_kind: RelationKind,
 }
 
+/// Task date a relative reminder is anchored to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReminderRelativeTo {
+    DueDate,
+    StartDate,
+    EndDate,
+}
+
+impl ReminderRelativeTo {
+    /// The snake_case string Vikunja uses for this anchor on the wire.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DueDate => "due_date",
+            Self::StartDate => "start_date",
+            Self::EndDate => "end_date",
+        }
+    }
+}
+
+/// One reminder to write: an absolute time (`reminder` or
+/// `reminder_shortcut`) or a relative one (`relative_to` +
+/// `relative_period_seconds`), never both.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReminderInput {
+    /// Absolute reminder time as RFC 3339, e.g. `2026-07-01T09:00:00Z`.
+    pub reminder: Option<String>,
+    /// Date shortcut for the reminder time, e.g. `tomorrow`, `next friday`,
+    /// `in 3 days`, `2026-07-01`. Mutually exclusive with `reminder`.
+    pub reminder_shortcut: Option<String>,
+    /// Anchor a relative reminder to this task date.
+    pub relative_to: Option<ReminderRelativeTo>,
+    /// Offset in seconds from `relative_to`; negative means before it
+    /// (e.g. -3600 = one hour before). Required with `relative_to`.
+    pub relative_period_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskRemindersAddArgs {
+    /// Numeric id of the task.
+    pub task_id: i64,
+    /// The reminder to add, inlined into the arguments.
+    #[serde(flatten)]
+    pub reminder: ReminderInput,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskRemindersSetArgs {
+    /// Numeric id of the task.
+    pub task_id: i64,
+    /// Replacement reminder list. An empty list removes all reminders.
+    pub reminders: Vec<ReminderInput>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CommentsCreateArgs {
     /// Numeric id of the task to comment on.
@@ -680,6 +734,17 @@ pub struct RelationListResult {
     pub relations: Vec<TaskRelationGroup>,
 }
 
+/// The reminders of one task, as stored by Vikunja after a read or write.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReminderListResult {
+    /// The task whose reminders these are.
+    pub task_id: i64,
+    /// The task's reminders. Relative reminders carry `relative_period` and
+    /// `relative_to`; Vikunja fills in the absolute `reminder` time once the
+    /// anchor date exists.
+    pub reminders: Vec<TaskReminder>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AttachmentListResult {
     pub attachments: Vec<TaskAttachment>,
@@ -866,6 +931,89 @@ fn relation_pair(task_id: i64, other_task_id: i64) -> Result<(i64, i64), McpErro
         .to_mcp());
     }
     Ok((task_id, other_task_id))
+}
+
+/// Validates one [`ReminderInput`] and turns it into the wire shape.
+/// Exactly one of "absolute" (`reminder` / `reminder_shortcut`) or
+/// "relative" (`relative_to` + `relative_period_seconds`) must be given.
+/// Shortcuts resolve against `reference` so every reminder in one call uses
+/// the same instant.
+fn build_reminder(
+    input: ReminderInput,
+    reference: &DateTime<Local>,
+    dates: &DateConfig,
+) -> Result<TaskReminder, McpError> {
+    let has_absolute = input.reminder.is_some() || input.reminder_shortcut.is_some();
+    let has_relative = input.relative_to.is_some() || input.relative_period_seconds.is_some();
+    if has_absolute && has_relative {
+        return Err(Error::InvalidArgument(
+            "provide either an absolute reminder (reminder or reminder_shortcut) or a relative \
+             one (relative_to with relative_period_seconds), not both"
+                .to_string(),
+        )
+        .to_mcp());
+    }
+    match (
+        input.reminder,
+        input.reminder_shortcut,
+        input.relative_to,
+        input.relative_period_seconds,
+    ) {
+        // Still reachable after the guard above: both absolute forms set
+        // with no relative fields.
+        (Some(_), Some(_), _, _) => Err(Error::InvalidArgument(
+            "provide either reminder or reminder_shortcut, not both".to_string(),
+        )
+        .to_mcp()),
+        (Some(timestamp), None, _, _) => {
+            if DateTime::parse_from_rfc3339(&timestamp).is_err() {
+                return Err(Error::InvalidArgument(format!(
+                    "reminder must be a valid RFC 3339 timestamp like 2026-07-01T09:00:00Z, \
+                     got {timestamp:?}"
+                ))
+                .to_mcp());
+            }
+            Ok(TaskReminder {
+                reminder: Some(timestamp),
+                relative_period: None,
+                relative_to: None,
+            })
+        }
+        (None, Some(expression), _, _) => {
+            match dates::resolve(&expression, reference, dates).map_err(|e| e.to_mcp())? {
+                Resolution::Clear => Err(Error::InvalidArgument(
+                    "a clear shortcut cannot be used as a reminder time; to remove reminders \
+                     call vikunja_task_reminders_set with an empty list"
+                        .to_string(),
+                )
+                .to_mcp()),
+                Resolution::Timestamp { datetime, .. } => Ok(TaskReminder {
+                    reminder: Some(datetime.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                    relative_period: None,
+                    relative_to: None,
+                }),
+            }
+        }
+        (None, None, Some(anchor), Some(period)) => Ok(TaskReminder {
+            reminder: None,
+            relative_period: Some(period),
+            relative_to: Some(anchor.as_str().to_string()),
+        }),
+        (None, None, Some(_), None) => Err(Error::InvalidArgument(
+            "relative_period_seconds is required with relative_to".to_string(),
+        )
+        .to_mcp()),
+        (None, None, None, Some(_)) => Err(Error::InvalidArgument(
+            "relative_to is required with relative_period_seconds".to_string(),
+        )
+        .to_mcp()),
+        (None, None, None, None) => Err(Error::InvalidArgument(
+            "provide a reminder: reminder, reminder_shortcut, or relative_to with \
+             relative_period_seconds"
+                .to_string(),
+        )
+        .to_mcp()),
+    }
 }
 
 fn non_empty(name: &str, value: &str) -> Result<(), McpError> {
@@ -1372,6 +1520,7 @@ impl VikunjaMcpServer {
             hex_color: args.hex_color,
             is_favorite: args.is_favorite,
             repeat_after: args.repeat_after,
+            reminders: None,
         };
         Ok(Json(self.client().update_task(id, &patch).await?))
     }
@@ -1552,6 +1701,7 @@ impl VikunjaMcpServer {
             hex_color: args.hex_color,
             is_favorite: args.is_favorite,
             repeat_after: args.repeat_after,
+            reminders: None,
         };
         // Reject an empty patch up front instead of failing every item.
         let patch_value = serde_json::to_value(&patch).map_err(|e| {
@@ -1926,6 +2076,73 @@ impl VikunjaMcpServer {
         Ok(Json(OperationResult {
             ok: true,
             message: message.message,
+        }))
+    }
+
+    // -- Task reminders --
+
+    #[tool(
+        name = "vikunja_task_reminders_list",
+        description = "List a Vikunja task's reminders (absolute times and offsets relative to due/start/end dates).",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn task_reminders_list(
+        &self,
+        Parameters(args): Parameters<TaskIdArgs>,
+    ) -> Result<Json<ReminderListResult>, McpError> {
+        let task_id = positive("task_id", args.task_id)?;
+        let task = self.client().get_task(task_id).await?;
+        Ok(Json(ReminderListResult {
+            task_id,
+            reminders: task.reminders.unwrap_or_default(),
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_task_reminders_add",
+        description = "Add one reminder to a Vikunja task, keeping existing reminders. Give an absolute time (reminder as RFC 3339, or reminder_shortcut like 'tomorrow'), or a relative one (relative_to due_date/start_date/end_date plus relative_period_seconds, negative = before). Not idempotent: calling it twice adds the same reminder twice."
+    )]
+    pub async fn task_reminders_add(
+        &self,
+        Parameters(args): Parameters<TaskRemindersAddArgs>,
+    ) -> Result<Json<ReminderListResult>, McpError> {
+        let task_id = positive("task_id", args.task_id)?;
+        let reference = Local::now();
+        let new_reminder = build_reminder(args.reminder, &reference, self.dates())?;
+        let updated = self
+            .client()
+            .append_task_reminder(task_id, &new_reminder)
+            .await?;
+        Ok(Json(ReminderListResult {
+            task_id,
+            reminders: updated.reminders.unwrap_or_default(),
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_task_reminders_set",
+        description = "Replace all reminders of a Vikunja task with the given list; an empty list removes every reminder. Each entry is an absolute time (reminder RFC 3339 or reminder_shortcut) or a relative one (relative_to + relative_period_seconds).",
+        annotations(idempotent_hint = true)
+    )]
+    pub async fn task_reminders_set(
+        &self,
+        Parameters(args): Parameters<TaskRemindersSetArgs>,
+    ) -> Result<Json<ReminderListResult>, McpError> {
+        let task_id = positive("task_id", args.task_id)?;
+        let reference = Local::now();
+        let reminders = args
+            .reminders
+            .into_iter()
+            .map(|input| build_reminder(input, &reference, self.dates()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let patch = TaskUpdate {
+            reminders: Some(reminders),
+            ..Default::default()
+        };
+        let updated = self.client().update_task(task_id, &patch).await?;
+        Ok(Json(ReminderListResult {
+            task_id,
+            reminders: updated.reminders.unwrap_or_default(),
         }))
     }
 
