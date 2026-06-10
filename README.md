@@ -52,9 +52,12 @@ Configuration comes from CLI flags or environment variables (flags win):
 | `VIKUNJA_DEFAULT_PAGE_SIZE` | `--default-page-size` | no | `50` | `per_page` used when a tool call does not specify one (1–250; the Vikunja server also caps it). |
 | `VIKUNJA_DATE_DEFAULT_TIME` | `--date-default-time` | no | `09:00` | Time of day (`HH:MM`) applied when a date shortcut resolves to a calendar day (see *Smart date shortcuts*). |
 | `VIKUNJA_DATE_END_OF_DAY_TIME` | `--date-end-of-day-time` | no | `23:59` | Time of day (`HH:MM`) used by the `end of week` date shortcut. |
+| `VIKUNJA_ATTACHMENT_UPLOAD_ROOTS` | `--attachment-upload-root` | no | – | Directories attachment uploads may read `file_path` files from (repeat the flag or separate with commas). Unset = any server-local path (see *Security notes*). |
+| `VIKUNJA_ATTACHMENT_DOWNLOAD_ROOTS` | `--attachment-download-root` | no | – | Directories attachment downloads may write `save_path` files to (repeat the flag or separate with commas). Unset = any server-local path (see *Security notes*). |
 
 Configuration is validated at startup; a missing/invalid URL or token fails
-fast with an actionable message.
+fast with an actionable message, and configured attachment roots must exist
+(a typo cannot silently disable the sandbox).
 
 ### stdio: example MCP client configuration
 
@@ -521,8 +524,20 @@ entities (cleanup is best-effort).
   environment over `--api-token` (flags can show up in `ps` output).
 - `vikunja_task_attachments_upload`/`_download` accept `file_path`/`save_path`
   arguments that read/write files **on the machine running this server** with
-  the server's privileges. If that is undesirable in your deployment, restrict
-  these tools in your MCP client's permission settings.
+  the server's privileges. For hosted or multi-user deployments, sandbox them
+  with `--attachment-upload-root`/`--attachment-download-root`: paths are
+  fully canonicalized before the check, so `..` traversal and symlinks cannot
+  escape a configured root, writes through pre-existing symlinks are refused,
+  and configured roots must exist at startup (fail closed). Rejections name
+  the offending path but never enumerate the configured roots. With no roots
+  configured, any server-local path is allowed (the historical behavior) —
+  restrict the tools in your MCP client's permission settings if that is
+  undesirable. Base64 uploads and inline (base64) downloads never touch the
+  server's filesystem and are unaffected. Like all path-check sandboxes it
+  cannot detect hard links that alias files outside a root, nor a symlink
+  swapped in between the check and the write; both require an attacker who
+  can already write inside the root, so dedicate the root directories to
+  this server.
 - The HTTP transport authenticates `/mcp` with a bearer token
   (`MCP_HTTP_AUTH_TOKEN`, compared in constant time) and refuses to start on
   non-loopback binds without one unless `--http-allow-unauthenticated` is

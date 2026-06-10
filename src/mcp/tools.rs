@@ -2435,9 +2435,15 @@ impl VikunjaMcpServer {
                 (file_name, bytes)
             }
             (None, Some(path)) => {
+                // Resolve against the sandbox first (canonicalizing the
+                // path), then do all IO through the resolved path.
+                let resolved = self
+                    .attachment_sandbox()
+                    .resolve_upload_path(&path)
+                    .map_err(|e| e.to_mcp())?;
                 // Check the size before reading so a huge file is rejected
                 // without buffering it.
-                let metadata = tokio::fs::metadata(&path).await.map_err(|e| {
+                let metadata = tokio::fs::metadata(&resolved).await.map_err(|e| {
                     Error::Io {
                         detail: format!("could not read {path}: {e}"),
                     }
@@ -2446,7 +2452,7 @@ impl VikunjaMcpServer {
                 if metadata.len() > MAX_UPLOAD_BYTES as u64 {
                     return Err(oversized_upload(metadata.len() as usize).to_mcp());
                 }
-                let bytes = tokio::fs::read(&path).await.map_err(|e| {
+                let bytes = tokio::fs::read(&resolved).await.map_err(|e| {
                     Error::Io {
                         detail: format!("could not read {path}: {e}"),
                     }
@@ -2454,7 +2460,7 @@ impl VikunjaMcpServer {
                 })?;
                 let file_name = match args.file_name {
                     Some(name) => name,
-                    None => std::path::Path::new(&path)
+                    None => resolved
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "attachment".to_string()),
@@ -2514,16 +2520,22 @@ impl VikunjaMcpServer {
         match args.save_path {
             // Stream straight to disk: no size limit and no full buffering.
             Some(path) => {
+                // Resolve against the sandbox first; the write goes to the
+                // resolved path (canonical parent + file name).
+                let resolved = self
+                    .attachment_sandbox()
+                    .resolve_download_path(&path)
+                    .map_err(|e| e.to_mcp())?;
                 let (size_bytes, mime) = self
                     .client()
-                    .download_attachment_to_file(task_id, attachment_id, &path)
+                    .download_attachment_to_file(task_id, attachment_id, &resolved)
                     .await?;
                 Ok(Json(DownloadResult {
                     task_id,
                     attachment_id,
                     mime,
                     size_bytes,
-                    saved_to: Some(path),
+                    saved_to: Some(resolved.display().to_string()),
                     content_base64: None,
                 }))
             }

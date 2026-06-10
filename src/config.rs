@@ -6,12 +6,14 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use url::Url;
 
 use crate::dates::{DateConfig, parse_time_of_day};
+use crate::sandbox::{AttachmentSandbox, InvalidRoot};
 
 /// Transport over which the MCP server is exposed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -80,6 +82,26 @@ pub struct Cli {
     /// Time of day (HH:MM) used by the `end of week` date shortcut.
     #[arg(long, default_value = "23:59", env = "VIKUNJA_DATE_END_OF_DAY_TIME")]
     pub date_end_of_day_time: String,
+
+    /// Directories attachment uploads may read files from (repeat the flag
+    /// or separate with commas). When unset, any server-local path is
+    /// allowed for vikunja_task_attachments_upload's file_path.
+    #[arg(
+        long = "attachment-upload-root",
+        env = "VIKUNJA_ATTACHMENT_UPLOAD_ROOTS",
+        value_delimiter = ','
+    )]
+    pub attachment_upload_roots: Vec<PathBuf>,
+
+    /// Directories attachment downloads may write files to (repeat the
+    /// flag or separate with commas). When unset, any server-local path is
+    /// allowed for vikunja_task_attachments_download's save_path.
+    #[arg(
+        long = "attachment-download-root",
+        env = "VIKUNJA_ATTACHMENT_DOWNLOAD_ROOTS",
+        value_delimiter = ','
+    )]
+    pub attachment_download_roots: Vec<PathBuf>,
 }
 
 /// A Vikunja API token that redacts itself in all formatting output.
@@ -136,6 +158,10 @@ pub enum ConfigError {
     #[error("MCP_HTTP_AUTH_TOKEN is set but empty")]
     EmptyHttpAuthToken,
     #[error(
+        "{0}: pass an existing directory for --attachment-upload-root/--attachment-download-root"
+    )]
+    InvalidAttachmentRoot(#[source] InvalidRoot),
+    #[error(
         "refusing to serve unauthenticated HTTP on non-loopback address {bind}: set MCP_HTTP_AUTH_TOKEN (recommended), or pass --http-allow-unauthenticated if an authenticating reverse proxy fronts this server"
     )]
     UnauthenticatedNonLoopback { bind: SocketAddr },
@@ -180,6 +206,8 @@ pub struct Config {
     pub default_page_size: u32,
     /// Times of day applied by date shortcuts.
     pub dates: DateConfig,
+    /// Path restrictions for the attachment tools' file operations.
+    pub attachment_sandbox: AttachmentSandbox,
 }
 
 impl Config {
@@ -225,12 +253,17 @@ impl Config {
             })?,
         };
 
+        let attachment_sandbox =
+            AttachmentSandbox::new(&cli.attachment_upload_roots, &cli.attachment_download_roots)
+                .map_err(ConfigError::InvalidAttachmentRoot)?;
+
         Ok(Self {
             vikunja_url,
             api_token: ApiToken::new(token),
             timeout: Duration::from_secs(cli.timeout_secs),
             default_page_size: cli.default_page_size,
             dates,
+            attachment_sandbox,
         })
     }
 }
@@ -469,6 +502,51 @@ mod tests {
         ]);
         let config = Config::from_cli(&cli).unwrap();
         assert!(!format!("{config:?}").contains("super_secret"));
+    }
+
+    #[test]
+    fn attachment_roots_default_to_permissive_sandbox() {
+        let cli = cli(&["--vikunja-url", "https://example.com", "--api-token", "t"]);
+        assert!(cli.attachment_upload_roots.is_empty());
+        assert!(cli.attachment_download_roots.is_empty());
+        let config = Config::from_cli(&cli).unwrap();
+        assert!(config.attachment_sandbox.is_permissive());
+    }
+
+    #[test]
+    fn attachment_roots_are_parsed_and_validated() {
+        let upload = tempfile::tempdir().unwrap();
+        let download = tempfile::tempdir().unwrap();
+        let cli = cli(&[
+            "--vikunja-url",
+            "https://example.com",
+            "--api-token",
+            "t",
+            "--attachment-upload-root",
+            upload.path().to_str().unwrap(),
+            "--attachment-download-root",
+            download.path().to_str().unwrap(),
+        ]);
+        let config = Config::from_cli(&cli).unwrap();
+        assert!(!config.attachment_sandbox.is_permissive());
+    }
+
+    #[test]
+    fn nonexistent_attachment_root_is_an_error() {
+        let cli = cli(&[
+            "--vikunja-url",
+            "https://example.com",
+            "--api-token",
+            "t",
+            "--attachment-upload-root",
+            "/definitely/not/a/real/directory",
+        ]);
+        let err = Config::from_cli(&cli).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidAttachmentRoot(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("attachment root"), "{err}");
     }
 
     #[test]

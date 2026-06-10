@@ -11,6 +11,7 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
 
 use crate::dates::DateConfig;
+use crate::sandbox::AttachmentSandbox;
 use crate::vikunja::VikunjaClient;
 
 use super::resources;
@@ -21,6 +22,7 @@ use super::resources;
 pub struct VikunjaMcpServer {
     client: Arc<VikunjaClient>,
     dates: DateConfig,
+    attachment_sandbox: Arc<AttachmentSandbox>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -29,6 +31,7 @@ impl VikunjaMcpServer {
         Self {
             client: Arc::new(client),
             dates: DateConfig::default(),
+            attachment_sandbox: Arc::new(AttachmentSandbox::default()),
             tool_router: Self::tool_router(),
         }
     }
@@ -39,6 +42,13 @@ impl VikunjaMcpServer {
         self
     }
 
+    /// Restricts the attachment tools' file reads/writes to the sandbox's
+    /// configured root directories. The default sandbox is permissive.
+    pub fn with_attachment_sandbox(mut self, sandbox: AttachmentSandbox) -> Self {
+        self.attachment_sandbox = Arc::new(sandbox);
+        self
+    }
+
     pub fn client(&self) -> &VikunjaClient {
         &self.client
     }
@@ -46,6 +56,11 @@ impl VikunjaMcpServer {
     /// Times of day applied when date shortcuts resolve.
     pub fn dates(&self) -> &DateConfig {
         &self.dates
+    }
+
+    /// Path restrictions applied to attachment file operations.
+    pub fn attachment_sandbox(&self) -> &AttachmentSandbox {
+        &self.attachment_sandbox
     }
 }
 
