@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiErrorKind, Error};
 use crate::schema::strip_unsigned_formats;
-use crate::vikunja::client::TaskListOptions;
+use crate::vikunja::client::{TaskListOptions, saved_filter_options};
 use crate::vikunja::models::{
-    Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, Task, TaskAttachment,
-    TaskComment, TaskCreate, TaskUpdate, Team, User,
+    Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, SavedFilter,
+    SavedFilterCreate, SavedFilterQuery, SavedFilterSummary, SavedFilterUpdate, Task,
+    TaskAttachment, TaskComment, TaskCreate, TaskUpdate, Team, User,
 };
 use crate::vikunja::pagination::{PageInfo, PageParams};
 
@@ -30,6 +31,10 @@ pub const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 /// fan-out (each id can cost several Vikunja requests) so a single MCP call
 /// cannot flood the instance or hold the connection open indefinitely.
 pub const MAX_BULK_TASK_IDS: usize = 100;
+/// Page cap when walking the project list to enumerate saved filters
+/// (Vikunja has no `GET /filters` list endpoint). With the default page
+/// size of 50 this covers 500 entries.
+pub const MAX_FILTER_LIST_PAGES: u32 = 10;
 
 // ----- Shared argument/output shapes ----------------------------------------
 
@@ -385,6 +390,93 @@ pub struct TeamsListArgs {
     pub project_id: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FiltersListArgs {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FilterIdArgs {
+    /// Numeric id of the saved filter (not the negative pseudo-project id;
+    /// find it with vikunja_filters_list).
+    pub filter_id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FiltersCreateArgs {
+    /// Filter title.
+    pub title: String,
+    /// Filter description.
+    pub description: Option<String>,
+    /// Vikunja filter expression to store, e.g. `done = false && priority >= 3`.
+    /// See https://vikunja.io/docs/filters.
+    pub filter: String,
+    /// Fields to sort matching tasks by, e.g. `["due_date", "id"]`.
+    pub sort_by: Option<Vec<String>>,
+    /// Sort directions matching `sort_by` position by position, e.g. `["asc"]`.
+    pub order_by: Option<Vec<String>>,
+    /// IANA timezone used to resolve relative dates like `now/d`.
+    pub filter_timezone: Option<String>,
+    /// Whether tasks with a null value in a filtered field match.
+    pub filter_include_nulls: Option<bool>,
+    /// Mark the saved filter as a favorite.
+    pub is_favorite: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FiltersUpdateArgs {
+    /// Numeric id of the saved filter to update.
+    pub filter_id: i64,
+    /// New title.
+    pub title: Option<String>,
+    /// New description.
+    pub description: Option<String>,
+    /// New filter expression (replaces the stored one; other stored query
+    /// fields keep their value).
+    pub filter: Option<String>,
+    /// New sort fields (replaces the stored list).
+    pub sort_by: Option<Vec<String>>,
+    /// New sort directions (replaces the stored list).
+    pub order_by: Option<Vec<String>>,
+    /// New timezone for relative dates.
+    pub filter_timezone: Option<String>,
+    /// Whether tasks with a null value in a filtered field match.
+    pub filter_include_nulls: Option<bool>,
+    /// Favorite (true) or unfavorite (false) the saved filter.
+    pub is_favorite: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct FilterTasksArgs {
+    /// Numeric id of the saved filter to evaluate.
+    pub filter_id: i64,
+    /// 1-based page number (default 1).
+    pub page: Option<u32>,
+    /// Items per page; the Vikunja server caps this (50 by default).
+    pub per_page: Option<u32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SavedFilterListResult {
+    pub filters: Vec<SavedFilterSummary>,
+}
+
+/// One page of tasks matching a saved filter, plus the query that was
+/// evaluated to produce it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FilterTasksResult {
+    pub filter_id: i64,
+    /// Title of the saved filter.
+    pub title: String,
+    /// The stored filter expression that was evaluated.
+    pub filter: Option<String>,
+    /// Sort field applied (first stored `sort_by` entry).
+    pub sort_by: Option<String>,
+    /// Sort direction applied (first stored `order_by` entry).
+    pub order_by: Option<String>,
+    pub tasks: Vec<Task>,
+    pub pagination: PageInfo,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ProjectListResult {
     pub projects: Vec<Project>,
@@ -558,6 +650,80 @@ fn page_params(page: Option<u32>, per_page: Option<u32>) -> Result<PageParams, M
 fn non_empty(name: &str, value: &str) -> Result<(), McpError> {
     if value.trim().is_empty() {
         return Err(Error::InvalidArgument(format!("{name} must not be empty")).to_mcp());
+    }
+    Ok(())
+}
+
+/// Validates the sort arguments of the saved-filter tools: Vikunja pairs
+/// `sort_by` and `order_by` positionally, so a length mismatch or a
+/// direction other than `asc`/`desc` silently misbehaves server-side and is
+/// rejected here instead.
+fn validate_sort_order(
+    sort_by: Option<&[String]>,
+    order_by: Option<&[String]>,
+) -> Result<(), McpError> {
+    if let (Some(sort), Some(order)) = (sort_by, order_by)
+        && sort.len() != order.len()
+    {
+        return Err(Error::InvalidArgument(format!(
+            "sort_by ({}) and order_by ({}) must have the same number of entries",
+            sort.len(),
+            order.len()
+        ))
+        .to_mcp());
+    }
+    for direction in order_by.unwrap_or_default() {
+        if direction != "asc" && direction != "desc" {
+            return Err(Error::InvalidArgument(format!(
+                "order_by entries must be 'asc' or 'desc', got {direction:?}"
+            ))
+            .to_mcp());
+        }
+    }
+    Ok(())
+}
+
+/// Light syntactic validation of a Vikunja filter expression. The server
+/// does not implement Vikunja's full filter grammar, but an empty
+/// expression, unbalanced parentheses or an unterminated quoted string are
+/// always invalid and are rejected before any request is sent.
+fn validate_filter_expression(name: &str, value: &str) -> Result<(), McpError> {
+    non_empty(name, value)?;
+    let mut depth: u32 = 0;
+    let mut quote: Option<char> = None;
+    for ch in value.chars() {
+        match quote {
+            Some(open) => {
+                if ch == open {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1).ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "{name} has unbalanced parentheses: ')' without a matching '('"
+                        ))
+                        .to_mcp()
+                    })?;
+                }
+                _ => {}
+            },
+        }
+    }
+    if let Some(open) = quote {
+        return Err(Error::InvalidArgument(format!(
+            "{name} has an unterminated quoted string (missing closing {open})"
+        ))
+        .to_mcp());
+    }
+    if depth != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "{name} has unbalanced parentheses: '(' without a matching ')'"
+        ))
+        .to_mcp());
     }
     Ok(())
 }
@@ -764,6 +930,7 @@ impl VikunjaMcpServer {
             project_id: args.project_id,
             sort_by: args.sort_by,
             order_by: args.order_by,
+            ..Default::default()
         };
         let page = self.client().list_tasks(&options).await?;
         Ok(Json(TaskListResult {
@@ -1561,6 +1728,151 @@ impl VikunjaMcpServer {
             pagination: page.info,
         }))
     }
+
+    // -- Saved filters --
+    //
+    // Vikunja stores saved filters behind /filters/{id} but has no list
+    // endpoint; each filter also appears in the project list as a
+    // pseudo-project with id `-filter_id - 1`. The list tool resolves that
+    // mapping so agents never have to deal with negative ids.
+
+    #[tool(
+        name = "vikunja_filters_list",
+        description = "List the user's saved Vikunja filters: durable, named task queries. Returns each filter's id, title and the negative pseudo-project id Vikunja lists it under. Use vikunja_filters_get for the stored query.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn filters_list(
+        &self,
+        Parameters(_args): Parameters<FiltersListArgs>,
+    ) -> Result<Json<SavedFilterListResult>, McpError> {
+        let filters = self
+            .client()
+            .list_saved_filters(MAX_FILTER_LIST_PAGES)
+            .await?;
+        Ok(Json(SavedFilterListResult { filters }))
+    }
+
+    #[tool(
+        name = "vikunja_filters_get",
+        description = "Get one saved Vikunja filter by id, including its stored filter expression, sort order and date semantics.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn filters_get(
+        &self,
+        Parameters(args): Parameters<FilterIdArgs>,
+    ) -> Result<Json<SavedFilter>, McpError> {
+        let id = positive("filter_id", args.filter_id)?;
+        Ok(Json(self.client().get_saved_filter(id).await?))
+    }
+
+    #[tool(
+        name = "vikunja_filters_create",
+        description = "Create a saved Vikunja filter from a filter expression (e.g. 'done = false && priority >= 3') plus optional sort order. The expression is checked for balanced parentheses and quotes before the write."
+    )]
+    pub async fn filters_create(
+        &self,
+        Parameters(args): Parameters<FiltersCreateArgs>,
+    ) -> Result<Json<SavedFilter>, McpError> {
+        non_empty("title", &args.title)?;
+        validate_filter_expression("filter", &args.filter)?;
+        validate_sort_order(args.sort_by.as_deref(), args.order_by.as_deref())?;
+        if let Some(timezone) = args.filter_timezone.as_deref() {
+            non_empty("filter_timezone", timezone)?;
+        }
+        let body = SavedFilterCreate {
+            title: args.title,
+            description: args.description,
+            filters: SavedFilterQuery {
+                filter: Some(args.filter),
+                sort_by: args.sort_by,
+                order_by: args.order_by,
+                filter_timezone: args.filter_timezone,
+                filter_include_nulls: args.filter_include_nulls,
+            },
+            is_favorite: args.is_favorite,
+        };
+        Ok(Json(self.client().create_saved_filter(&body).await?))
+    }
+
+    #[tool(
+        name = "vikunja_filters_update",
+        description = "Update a saved Vikunja filter. Only provided fields change: the stored query is merged field by field, so e.g. changing the filter expression keeps the stored sort order.",
+        annotations(idempotent_hint = true)
+    )]
+    pub async fn filters_update(
+        &self,
+        Parameters(args): Parameters<FiltersUpdateArgs>,
+    ) -> Result<Json<SavedFilter>, McpError> {
+        let id = positive("filter_id", args.filter_id)?;
+        if let Some(title) = args.title.as_deref() {
+            non_empty("title", title)?;
+        }
+        if let Some(filter) = args.filter.as_deref() {
+            validate_filter_expression("filter", filter)?;
+        }
+        validate_sort_order(args.sort_by.as_deref(), args.order_by.as_deref())?;
+        if let Some(timezone) = args.filter_timezone.as_deref() {
+            non_empty("filter_timezone", timezone)?;
+        }
+        let query = SavedFilterQuery {
+            filter: args.filter,
+            sort_by: args.sort_by,
+            order_by: args.order_by,
+            filter_timezone: args.filter_timezone,
+            filter_include_nulls: args.filter_include_nulls,
+        };
+        let patch = SavedFilterUpdate {
+            title: args.title,
+            description: args.description,
+            filters: (query != SavedFilterQuery::default()).then_some(query),
+            is_favorite: args.is_favorite,
+        };
+        Ok(Json(self.client().update_saved_filter(id, &patch).await?))
+    }
+
+    #[tool(
+        name = "vikunja_filters_delete",
+        description = "Delete a saved Vikunja filter. Tasks are not affected; only the stored query is removed. This cannot be undone.",
+        annotations(destructive_hint = true)
+    )]
+    pub async fn filters_delete(
+        &self,
+        Parameters(args): Parameters<FilterIdArgs>,
+    ) -> Result<Json<OperationResult>, McpError> {
+        let id = positive("filter_id", args.filter_id)?;
+        let message = self.client().delete_saved_filter(id).await?;
+        Ok(Json(OperationResult {
+            ok: true,
+            message: message.message,
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_filters_tasks",
+        description = "List the tasks matching a saved Vikunja filter by evaluating its stored query (filter expression, timezone/null handling and the first stored sort pair). Paginated like vikunja_tasks_list.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn filters_tasks(
+        &self,
+        Parameters(args): Parameters<FilterTasksArgs>,
+    ) -> Result<Json<FilterTasksResult>, McpError> {
+        let id = positive("filter_id", args.filter_id)?;
+        page_params(args.page, args.per_page)?;
+        let filter = self.client().get_saved_filter(id).await?;
+        let mut options = saved_filter_options(&filter);
+        options.page = args.page;
+        options.per_page = args.per_page;
+        let page = self.client().list_tasks(&options).await?;
+        Ok(Json(FilterTasksResult {
+            filter_id: id,
+            title: filter.title,
+            filter: options.filter,
+            sort_by: options.sort_by,
+            order_by: options.order_by,
+            tasks: page.items,
+            pagination: page.info,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -1652,6 +1964,67 @@ mod tests {
             assert_eq!(detail.vikunja_error_code, None);
             assert!(!detail.message.is_empty());
         }
+    }
+
+    #[test]
+    fn validate_filter_expression_accepts_well_formed_expressions() {
+        for expression in [
+            "done = false",
+            "(done = false) && priority >= 3",
+            "title ~ 'has (parens) inside'",
+            "title ~ \"it's quoted\"",
+            "due_date < now/d+7d",
+        ] {
+            assert!(
+                validate_filter_expression("filter", expression).is_ok(),
+                "{expression} should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_filter_expression_rejects_malformed_expressions() {
+        for (expression, expected) in [
+            ("", "empty"),
+            ("   ", "empty"),
+            ("(done = false", "parenthes"),
+            ("done = false)", "parenthes"),
+            ("((done = false) && x = 1", "parenthes"),
+            ("title ~ 'unterminated", "quote"),
+            ("title ~ \"unterminated", "quote"),
+        ] {
+            let err = validate_filter_expression("filter", expression).unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(
+                err.message.contains(expected),
+                "{expression:?}: expected '{expected}' in '{}'",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn validate_sort_order_checks_lengths_and_directions() {
+        let fields = |items: &[&str]| items.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert!(validate_sort_order(None, None).is_ok());
+        assert!(validate_sort_order(Some(&fields(&["due_date"])), None).is_ok());
+        assert!(validate_sort_order(Some(&fields(&["due_date"])), Some(&fields(&["asc"]))).is_ok());
+        assert!(
+            validate_sort_order(
+                Some(&fields(&["due_date", "id"])),
+                Some(&fields(&["asc", "desc"]))
+            )
+            .is_ok()
+        );
+
+        let mismatch =
+            validate_sort_order(Some(&fields(&["due_date", "id"])), Some(&fields(&["asc"])))
+                .unwrap_err();
+        assert!(mismatch.message.contains("same number"));
+
+        let bad_direction = validate_sort_order(None, Some(&fields(&["upward"]))).unwrap_err();
+        assert!(bad_direction.message.contains("'asc' or 'desc'"));
     }
 
     #[test]

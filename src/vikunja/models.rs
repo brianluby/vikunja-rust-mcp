@@ -335,6 +335,119 @@ pub struct Team {
     pub updated: Option<String>,
 }
 
+/// The query stored inside a saved filter (`models.TaskCollection`):
+/// a Vikunja filter expression plus sort order and date semantics.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SavedFilterQuery {
+    /// Vikunja filter expression, e.g. `done = false && priority >= 3`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Fields to sort by, e.g. `["due_date", "id"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_by: Option<Vec<String>>,
+    /// Sort directions matching `sort_by` position by position, e.g.
+    /// `["asc", "desc"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<Vec<String>>,
+    /// IANA timezone used to resolve relative dates like `now/d`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_timezone: Option<String>,
+    /// Whether tasks with a null value in a filtered field match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_include_nulls: Option<bool>,
+}
+
+/// A saved filter (`models.SavedFilter`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SavedFilter {
+    pub id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    /// The stored query this filter evaluates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<SavedFilterQuery>,
+    #[serde(default)]
+    pub is_favorite: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<User>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+/// Payload for `PUT /filters`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SavedFilterCreate {
+    /// Filter title (required by Vikunja).
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The query to store.
+    pub filters: SavedFilterQuery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_favorite: Option<bool>,
+}
+
+/// Partial update for `POST /filters/{id}`. Fields left as `None` keep
+/// their current value; inside `filters`, individual query fields are
+/// merged onto the stored query the same way.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SavedFilterUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<SavedFilterQuery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_favorite: Option<bool>,
+}
+
+/// Lightweight saved-filter listing entry. Vikunja has no `GET /filters`
+/// endpoint; instead each saved filter appears in the project list as a
+/// pseudo-project with id `-filter_id - 1` (so ids <= -2 are filters).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SavedFilterSummary {
+    /// Numeric id of the saved filter, for use with the filter tools.
+    pub filter_id: i64,
+    /// The negative pseudo-project id Vikunja lists this filter under.
+    pub pseudo_project_id: i64,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub is_favorite: bool,
+}
+
+impl SavedFilterSummary {
+    /// Interprets a project-list entry as a saved filter, if its id is in
+    /// the pseudo-project range.
+    pub fn from_project(project: &Project) -> Option<Self> {
+        let filter_id = saved_filter_id_from_project_id(project.id)?;
+        Some(Self {
+            filter_id,
+            pseudo_project_id: project.id,
+            title: project.title.clone(),
+            description: project.description.clone(),
+            is_favorite: project.is_favorite,
+        })
+    }
+}
+
+/// The pseudo-project id Vikunja uses for a saved filter.
+pub fn saved_filter_pseudo_project_id(filter_id: i64) -> i64 {
+    -filter_id - 1
+}
+
+/// The saved filter id behind a pseudo-project id, if it is one
+/// (ids <= -2; -1 is reserved and positive ids are real projects).
+pub fn saved_filter_id_from_project_id(project_id: i64) -> Option<i64> {
+    (project_id <= -2).then_some(-project_id - 1)
+}
+
 /// Generic `{"message": "..."}` response (`models.Message`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Message {
@@ -471,6 +584,77 @@ mod tests {
         let team: Team = serde_json::from_value(json).unwrap();
         assert_eq!(team.permission, Some(1));
         assert!(team.members.unwrap()[0].admin);
+    }
+
+    #[test]
+    fn saved_filter_round_trips_and_ignores_unknown_fields() {
+        let json = serde_json::json!({
+            "id": 9, "title": "Open work", "description": "open tasks",
+            "filters": {
+                "sort_by": ["due_date"], "order_by": ["asc"],
+                "filter": "done = false",
+                "filter_timezone": "UTC", "filter_include_nulls": true,
+                "some_future_field": 1
+            },
+            "owner": {"id": 1, "username": "ada"},
+            "is_favorite": true,
+            "created": "2026-01-01T00:00:00Z"
+        });
+        let filter: SavedFilter = serde_json::from_value(json).unwrap();
+        assert_eq!(filter.id, 9);
+        assert!(filter.is_favorite);
+        let query = filter.filters.as_ref().unwrap();
+        assert_eq!(query.filter.as_deref(), Some("done = false"));
+        assert_eq!(query.filter_include_nulls, Some(true));
+        let back: SavedFilter =
+            serde_json::from_value(serde_json::to_value(&filter).unwrap()).unwrap();
+        assert_eq!(back, filter);
+    }
+
+    #[test]
+    fn saved_filter_create_omits_unset_fields() {
+        let body = SavedFilterCreate {
+            title: "Open".into(),
+            filters: SavedFilterQuery {
+                filter: Some("done = false".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"title": "Open", "filters": {"filter": "done = false"}})
+        );
+    }
+
+    #[test]
+    fn saved_filter_pseudo_project_ids_convert_both_ways() {
+        assert_eq!(saved_filter_pseudo_project_id(1), -2);
+        assert_eq!(saved_filter_pseudo_project_id(41), -42);
+        assert_eq!(saved_filter_id_from_project_id(-2), Some(1));
+        assert_eq!(saved_filter_id_from_project_id(-42), Some(41));
+        // Real projects and the reserved -1 id are not filters.
+        assert_eq!(saved_filter_id_from_project_id(7), None);
+        assert_eq!(saved_filter_id_from_project_id(0), None);
+        assert_eq!(saved_filter_id_from_project_id(-1), None);
+    }
+
+    #[test]
+    fn saved_filter_summary_derives_only_from_pseudo_projects() {
+        let pseudo: Project = serde_json::from_value(serde_json::json!({
+            "id": -2, "title": "Open work", "description": "d", "is_favorite": true
+        }))
+        .unwrap();
+        let summary = SavedFilterSummary::from_project(&pseudo).unwrap();
+        assert_eq!(summary.filter_id, 1);
+        assert_eq!(summary.pseudo_project_id, -2);
+        assert_eq!(summary.title, "Open work");
+        assert!(summary.is_favorite);
+
+        let real: Project =
+            serde_json::from_value(serde_json::json!({"id": 3, "title": "Inbox"})).unwrap();
+        assert!(SavedFilterSummary::from_project(&real).is_none());
     }
 
     #[test]
