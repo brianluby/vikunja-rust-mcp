@@ -6,6 +6,8 @@
 //! rest. Write payloads are separate types so that `None` fields are omitted
 //! from request bodies.
 
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
 use schemars::transform::RecursiveTransform;
 use serde::{Deserialize, Serialize};
@@ -187,6 +189,78 @@ pub struct Task {
     pub created: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated: Option<String>,
+    /// Related tasks grouped by relation kind, as returned by
+    /// `GET /tasks/{id}`. Keys are kept as strings so kinds added by a newer
+    /// Vikunja server do not break deserialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_tasks: Option<BTreeMap<String, Vec<Task>>>,
+}
+
+/// Kind of a relation between two tasks (`models.RelationKind`). Vikunja's
+/// `unknown` kind is intentionally not accepted: it is never valid in a
+/// create or delete request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+// `lowercase` folds multi-word variants without separators (`ParentTask` ->
+// `parenttask`), matching Vikunja exactly; `as_str` must stay in sync.
+#[serde(rename_all = "lowercase")]
+pub enum RelationKind {
+    /// The other task is a subtask of this task.
+    Subtask,
+    /// The other task is the parent of this task.
+    ParentTask,
+    /// The tasks are loosely related.
+    Related,
+    /// This task is a duplicate of the other task.
+    DuplicateOf,
+    /// The other task duplicates this task.
+    Duplicates,
+    /// This task blocks the other task.
+    Blocking,
+    /// This task is blocked by the other task.
+    Blocked,
+    /// This task precedes the other task.
+    Precedes,
+    /// This task follows the other task.
+    Follows,
+    /// This task was copied from the other task.
+    CopiedFrom,
+    /// The other task was copied from this task.
+    CopiedTo,
+}
+
+impl RelationKind {
+    /// The lowercase string Vikunja uses for this kind in JSON bodies and
+    /// URL paths.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subtask => "subtask",
+            Self::ParentTask => "parenttask",
+            Self::Related => "related",
+            Self::DuplicateOf => "duplicateof",
+            Self::Duplicates => "duplicates",
+            Self::Blocking => "blocking",
+            Self::Blocked => "blocked",
+            Self::Precedes => "precedes",
+            Self::Follows => "follows",
+            Self::CopiedFrom => "copiedfrom",
+            Self::CopiedTo => "copiedto",
+        }
+    }
+}
+
+/// A relation between two tasks (`models.TaskRelation`), as returned by
+/// `PUT /tasks/{taskID}/relations`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskRelation {
+    #[serde(default)]
+    pub task_id: i64,
+    #[serde(default)]
+    pub other_task_id: i64,
+    pub relation_kind: RelationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<User>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
 }
 
 /// Payload for `PUT /projects/{id}/tasks`.
@@ -407,6 +481,76 @@ mod tests {
         assert_eq!(task.labels.as_ref().unwrap()[0].title, "urgent");
         assert_eq!(task.assignees.as_ref().unwrap()[0].username, "ada");
         assert_eq!(task.identifier, "DOCS-7");
+    }
+
+    #[test]
+    fn relation_kind_serializes_to_vikunja_strings() {
+        let cases: &[(RelationKind, &str)] = &[
+            (RelationKind::Subtask, "subtask"),
+            (RelationKind::ParentTask, "parenttask"),
+            (RelationKind::Related, "related"),
+            (RelationKind::DuplicateOf, "duplicateof"),
+            (RelationKind::Duplicates, "duplicates"),
+            (RelationKind::Blocking, "blocking"),
+            (RelationKind::Blocked, "blocked"),
+            (RelationKind::Precedes, "precedes"),
+            (RelationKind::Follows, "follows"),
+            (RelationKind::CopiedFrom, "copiedfrom"),
+            (RelationKind::CopiedTo, "copiedto"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!(expected),
+                "serializing {kind:?}"
+            );
+            let back: RelationKind = serde_json::from_value(serde_json::json!(expected)).unwrap();
+            assert_eq!(back, *kind, "deserializing {expected}");
+            assert_eq!(kind.as_str(), *expected);
+        }
+    }
+
+    #[test]
+    fn relation_kind_rejects_unknown_values() {
+        for bad in ["unknown", "blocks", "SUBTASK", ""] {
+            assert!(
+                serde_json::from_value::<RelationKind>(serde_json::json!(bad)).is_err(),
+                "{bad:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn task_relation_deserializes_from_api_shape() {
+        let relation: TaskRelation = serde_json::from_value(serde_json::json!({
+            "task_id": 5, "other_task_id": 9, "relation_kind": "precedes",
+            "created_by": {"id": 1, "username": "ada"},
+            "created": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(relation.task_id, 5);
+        assert_eq!(relation.other_task_id, 9);
+        assert_eq!(relation.relation_kind, RelationKind::Precedes);
+    }
+
+    #[test]
+    fn task_related_tasks_default_to_none_and_round_trip() {
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": 1, "title": "t", "project_id": 2
+        }))
+        .unwrap();
+        assert!(task.related_tasks.is_none());
+        // None must stay invisible when serialized (backward compatibility).
+        let value = serde_json::to_value(&task).unwrap();
+        assert!(value.get("related_tasks").is_none());
+
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": 1, "title": "t", "project_id": 2,
+            "related_tasks": {"subtask": [{"id": 4, "title": "child", "project_id": 2}]}
+        }))
+        .unwrap();
+        let related = task.related_tasks.unwrap();
+        assert_eq!(related["subtask"][0].id, 4);
     }
 
     #[test]

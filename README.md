@@ -150,6 +150,9 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_labels_delete` | Delete a label. |
 | `vikunja_task_labels_add` | Add a label to a task. |
 | `vikunja_task_labels_remove` | Remove a label from a task. |
+| `vikunja_task_relations_list` | List a task's relations grouped by kind (subtask, blocking, ...). |
+| `vikunja_task_relations_create` | Relate two tasks (blocking, subtask, precedes, ...). |
+| `vikunja_task_relations_delete` | Remove a relation between two tasks. |
 | `vikunja_task_comments_list` | List a task's comments. |
 | `vikunja_task_comments_create` | Comment on a task. |
 | `vikunja_task_comments_update` | Edit a comment. |
@@ -174,6 +177,19 @@ payload. To make partial updates safe, this server first `GET`s the current
 entity, overlays only the fields you provided, and writes the merged object
 back. Fields you don't pass keep their values. To clear a date field, pass
 the zero value `0001-01-01T00:00:00Z` explicitly.
+
+### Task relations
+
+Relations are **directional**: the `relation_kind` describes the link as
+seen from `task_id`. For example
+`{"task_id": 5, "other_task_id": 9, "relation_kind": "blocking"}` means
+*task 5 blocks task 9* (Vikunja stores the inverse `blocked` relation on
+task 9 automatically). Supported kinds: `subtask`, `parenttask`, `related`,
+`duplicateof`, `duplicates`, `blocking`, `blocked`, `precedes`, `follows`,
+`copiedfrom`, `copiedto`. Both task ids must be positive and distinct, and
+the kind is validated against this list before any request is sent; creating
+a relation that already exists or naming a missing task surfaces the Vikunja
+error (HTTP status and error code) unchanged.
 
 ### Bulk semantics (explicit ids, partial failure)
 
