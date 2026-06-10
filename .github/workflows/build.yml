@@ -81,11 +81,33 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           path: release
           merge-multiple: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo cyclonedx \
+            --format json \
+            --all-features \
+            --target all \
+            --spec-version 1.5 \
+            --override-filename vikunja-rust-mcp-sbom.cdx
+          mv vikunja-rust-mcp-sbom.cdx.json release/vikunja-rust-mcp-sbom.cdx.json
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

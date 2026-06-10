@@ -28,6 +28,13 @@ cargo build --release
 # binary at target/release/vikunja-rust-mcp
 ```
 
+## Release Artifacts
+
+Tagged releases publish platform packages for Linux, macOS and Windows. Each
+release also includes `vikunja-rust-mcp-sbom.cdx.json`, a CycloneDX 1.5 SBOM
+generated from the locked Cargo dependency graph with all features and targets
+included.
+
 ## Configuration
 
 Configuration comes from CLI flags or environment variables (flags win):
