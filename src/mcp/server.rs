@@ -80,7 +80,8 @@ impl ServerHandler for VikunjaMcpServer {
         .with_instructions(concat!(
             "Bridge to a Vikunja (to-do / project management) instance. ",
             "Tools cover projects, tasks, labels, assignees, comments, attachments, ",
-            "user search, teams and saved filters. ",
+            "user search, teams, saved filters and read-only Kanban buckets ",
+            "(board lanes by name via vikunja_buckets_list). ",
             "Typical flow: find a project with vikunja_projects_list, list its tasks ",
             "with vikunja_tasks_list (project_id), then create/update/complete tasks. ",
             "List tools paginate: check the `pagination` object and request further ",

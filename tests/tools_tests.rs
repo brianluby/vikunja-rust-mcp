@@ -83,6 +83,9 @@ const EXPECTED_TOOLS: &[&str] = &[
     "vikunja_task_relations_list",
     "vikunja_task_relations_create",
     "vikunja_task_relations_delete",
+    "vikunja_task_reminders_list",
+    "vikunja_task_reminders_add",
+    "vikunja_task_reminders_set",
     "vikunja_task_comments_list",
     "vikunja_task_comments_create",
     "vikunja_task_comments_update",
@@ -99,6 +102,8 @@ const EXPECTED_TOOLS: &[&str] = &[
     "vikunja_filters_update",
     "vikunja_filters_delete",
     "vikunja_filters_tasks",
+    "vikunja_project_views_list",
+    "vikunja_buckets_list",
     "vikunja_dates_resolve",
 ];
 
@@ -1599,7 +1604,7 @@ async fn resources_are_listed_and_readable() {
     assert!(uris.contains(&"vikunja://tasks"));
 
     let templates = client.list_resource_templates(None).await.unwrap();
-    assert_eq!(templates.resource_templates.len(), 4);
+    assert_eq!(templates.resource_templates.len(), 5);
 
     // Status resource: reports config without leaking the token.
     let status = client
@@ -3356,6 +3361,624 @@ async fn one_page_lists_omit_auto_pagination_metadata() {
     assert!(
         body.get("auto_pagination").is_none(),
         "one-page responses must not grow an auto_pagination block: {body}"
+    );
+    client.cancel().await.unwrap();
+}
+
+// ----- kanban buckets -------------------------------------------------------------
+
+fn buckets_json() -> serde_json::Value {
+    json!([
+        {
+            "id": 1, "title": "Backlog", "project_view_id": 4,
+            "limit": 0, "count": 1, "position": 100,
+            "tasks": [{"id": 11, "title": "Plan the thing", "project_id": 7, "bucket_id": 1}]
+        },
+        {
+            "id": 2, "title": "Doing", "project_view_id": 4,
+            "limit": 3, "count": 1, "position": 200,
+            "tasks": [{"id": 12, "title": "Build the thing", "project_id": 7, "bucket_id": 2}]
+        },
+    ])
+}
+
+fn views_json() -> serde_json::Value {
+    json!([
+        {"id": 1, "title": "List", "project_id": 7, "view_kind": "list"},
+        {"id": 4, "title": "Kanban", "project_id": 7, "view_kind": "kanban",
+         "default_bucket_id": 1, "done_bucket_id": 2},
+    ])
+}
+
+#[tokio::test]
+async fn project_views_list_returns_views() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(views_json()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_project_views_list",
+        json!({"project_id": 7}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["views"].as_array().unwrap().len(), 2);
+    assert_eq!(body["views"][1]["view_kind"], "kanban");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn buckets_list_resolves_kanban_view_automatically() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(views_json()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views/4/buckets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(buckets_json()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(&client, "vikunja_buckets_list", json!({"project_id": 7}))
+        .await
+        .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["project_id"], 7);
+    assert_eq!(body["view_id"], 4);
+    assert_eq!(body["view_title"], "Kanban");
+    let buckets = body["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(buckets[0]["title"], "Backlog");
+    assert_eq!(buckets[0]["is_default_bucket"], true);
+    assert_eq!(buckets[0]["is_done_bucket"], false);
+    assert_eq!(buckets[1]["title"], "Doing");
+    assert_eq!(buckets[1]["is_done_bucket"], true);
+    assert_eq!(buckets[1]["tasks"][0]["title"], "Build the thing");
+    assert_eq!(buckets[1]["tasks"][0]["bucket_id"], 2);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn buckets_list_uses_explicit_view_id_without_views_call() {
+    let server = MockServer::start().await;
+    // No /views mock: an explicit view_id must skip view resolution.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views/4/buckets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(buckets_json()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_buckets_list",
+        json!({"project_id": 7, "view_id": 4}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["view_id"], 4);
+    // Without the views listing the title and the done/default flags are
+    // unknown and omitted entirely (not reported as false).
+    assert!(body.get("view_title").is_none());
+    assert!(body["buckets"][1].get("is_done_bucket").is_none());
+    assert!(body["buckets"][1].get("is_default_bucket").is_none());
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn buckets_list_errors_when_project_has_no_kanban_view() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 1, "title": "List", "project_id": 7, "view_kind": "list"}
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let err = call(&client, "vikunja_buckets_list", json!({"project_id": 7}))
+        .await
+        .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("kanban"), "{}", data.message);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn bucket_tools_validate_ids_before_any_request() {
+    let client = connect("http://127.0.0.1:1").await;
+    for (tool, args) in [
+        ("vikunja_project_views_list", json!({"project_id": 0})),
+        ("vikunja_buckets_list", json!({"project_id": -7})),
+        (
+            "vikunja_buckets_list",
+            json!({"project_id": 7, "view_id": 0}),
+        ),
+    ] {
+        let err = call(&client, tool, args.clone()).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error for {tool} {args}");
+        };
+        assert!(data.message.contains("positive"), "{}", data.message);
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn buckets_resource_template_reads_project_buckets() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(views_json()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views/4/buckets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(buckets_json()))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let templates = client.list_resource_templates(None).await.unwrap();
+    let template_uris: Vec<&str> = templates
+        .resource_templates
+        .iter()
+        .map(|t| t.raw.uri_template.as_str())
+        .collect();
+    assert!(template_uris.contains(&"vikunja://projects/{id}/buckets"));
+
+    let result = client
+        .read_resource(ReadResourceRequestParams::new(
+            "vikunja://projects/7/buckets",
+        ))
+        .await
+        .unwrap();
+    let ResourceContents::TextResourceContents { text, .. } = &result.contents[0] else {
+        panic!("expected text contents");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["view_id"], 4);
+    assert_eq!(parsed["buckets"][1]["title"], "Doing");
+    client.cancel().await.unwrap();
+}
+
+// ----- task reminders -----------------------------------------------------------
+
+#[tokio::test]
+async fn task_reminders_list_returns_reminders() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 7, "title": "t", "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-07-01T09:00:00Z"},
+                {"reminder": "2026-06-30T08:00:00Z", "relative_period": -3600,
+                 "relative_to": "due_date"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_reminders_list",
+        json!({"task_id": 7}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["task_id"], 7);
+    let reminders = body["reminders"].as_array().unwrap();
+    assert_eq!(reminders.len(), 2);
+    assert_eq!(reminders[0]["reminder"], "2026-07-01T09:00:00Z");
+    assert_eq!(reminders[1]["relative_period"], -3600);
+    assert_eq!(reminders[1]["relative_to"], "due_date");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_reminders_list_empty_when_task_has_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/8"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 8, "title": "t", "project_id": 3
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_reminders_list",
+        json!({"task_id": 8}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        structured(&result)["reminders"].as_array().unwrap().len(),
+        0
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_reminders_add_appends_to_existing() {
+    let server = MockServer::start().await;
+    // Exactly one GET: the list that is appended to must be the same fetch
+    // that is merged and written back, or a concurrent change could be
+    // silently dropped.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3,
+            "reminders": [{"reminder": "2026-01-01T09:00:00Z"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-01-01T09:00:00Z"},
+                {"reminder": "2026-07-01T09:00:00Z"}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-01-01T09:00:00Z"},
+                {"reminder": "2026-07-01T09:00:00Z"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_reminders_add",
+        json!({"task_id": 9, "reminder": "2026-07-01T09:00:00Z"}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["task_id"], 9);
+    assert_eq!(body["reminders"].as_array().unwrap().len(), 2);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_reminders_add_resolves_shortcut() {
+    let expected = local_rfc3339(2026, 7, 1, 9, 0);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": [{"reminder": expected}]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": [{"reminder": expected}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_reminders_add",
+        json!({"task_id": 9, "reminder_shortcut": "2026-07-01"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        structured(&result)["reminders"][0]["reminder"],
+        local_rfc3339(2026, 7, 1, 9, 0)
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_reminders_add_relative_to_due_date() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "due_date": "2026-07-01T12:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "due_date": "2026-07-01T12:00:00Z",
+            "reminders": [{"relative_period": -3600, "relative_to": "due_date"}]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "due_date": "2026-07-01T12:00:00Z",
+            "reminders": [
+                {"reminder": "2026-07-01T11:00:00Z", "relative_period": -3600,
+                 "relative_to": "due_date"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_reminders_add",
+        json!({"task_id": 9, "relative_to": "due_date", "relative_period_seconds": -3600}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        structured(&result)["reminders"][0]["relative_to"],
+        "due_date"
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_reminders_set_replaces_list() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": [{"reminder": "2026-01-01T09:00:00Z"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-08-01T09:00:00Z"},
+                {"relative_period": 600, "relative_to": "start_date"}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-08-01T09:00:00Z"},
+                {"reminder": "2026-09-01T00:10:00Z", "relative_period": 600,
+                 "relative_to": "start_date"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_reminders_set",
+        json!({"task_id": 9, "reminders": [
+            {"reminder": "2026-08-01T09:00:00Z"},
+            {"relative_to": "start_date", "relative_period_seconds": 600}
+        ]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        structured(&result)["reminders"].as_array().unwrap().len(),
+        2
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_reminders_set_empty_clears_all() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": [{"reminder": "2026-01-01T09:00:00Z"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": []
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_reminders_set",
+        json!({"task_id": 9, "reminders": []}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        structured(&result)["reminders"].as_array().unwrap().len(),
+        0
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_reminders_add_validates_arguments() {
+    // Unreachable Vikunja: validation must fire before any request.
+    let client = connect("http://127.0.0.1:1").await;
+    for (args, needle) in [
+        // Absolute and shortcut together.
+        (
+            json!({"task_id": 9, "reminder": "2026-07-01T09:00:00Z",
+                   "reminder_shortcut": "tomorrow"}),
+            "reminder",
+        ),
+        // Absolute and relative together.
+        (
+            json!({"task_id": 9, "reminder": "2026-07-01T09:00:00Z",
+                   "relative_to": "due_date", "relative_period_seconds": -60}),
+            "relative",
+        ),
+        // Relative anchor without period.
+        (
+            json!({"task_id": 9, "relative_to": "due_date"}),
+            "relative_period_seconds",
+        ),
+        // Period without anchor.
+        (
+            json!({"task_id": 9, "relative_period_seconds": -60}),
+            "relative_to",
+        ),
+        // Nothing at all.
+        (json!({"task_id": 9}), "reminder"),
+        // Invalid RFC 3339 timestamp.
+        (json!({"task_id": 9, "reminder": "not-a-date"}), "RFC 3339"),
+        // A clear shortcut makes no sense for adding a reminder.
+        (json!({"task_id": 9, "reminder_shortcut": "clear"}), "clear"),
+    ] {
+        let err = call(&client, "vikunja_task_reminders_add", args.clone())
+            .await
+            .unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error for {args}, got {err:?}");
+        };
+        assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{args}");
+        assert!(
+            data.message.contains(needle),
+            "message {:?} should mention {needle:?} for {args}",
+            data.message
+        );
+    }
+
+    // Unknown relative_to anchors fail schema validation.
+    let err = call(
+        &client,
+        "vikunja_task_reminders_add",
+        json!({"task_id": 9, "relative_to": "created", "relative_period_seconds": -60}),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ServiceError::McpError(_)), "got {err:?}");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_reminders_set_validates_entries() {
+    let client = connect("http://127.0.0.1:1").await;
+    let err = call(
+        &client,
+        "vikunja_task_reminders_set",
+        json!({"task_id": 9, "reminders": [
+            {"reminder": "2026-08-01T09:00:00Z"},
+            {"reminder": "not-a-date"}
+        ]}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error, got {err:?}");
+    };
+    assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(data.message.contains("RFC 3339"));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_reminders_reject_nonpositive_task_ids() {
+    let client = connect("http://127.0.0.1:1").await;
+    for (tool, args) in [
+        ("vikunja_task_reminders_list", json!({"task_id": 0})),
+        (
+            "vikunja_task_reminders_add",
+            json!({"task_id": -1, "reminder": "2026-07-01T09:00:00Z"}),
+        ),
+        (
+            "vikunja_task_reminders_set",
+            json!({"task_id": 0, "reminders": []}),
+        ),
+    ] {
+        let err = call(&client, tool, args).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error from {tool}");
+        };
+        assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(data.message.contains("task_id"));
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_reminders_tool_annotations() {
+    let client = connect("http://127.0.0.1:1").await;
+    let tools = client.list_all_tools().await.unwrap();
+    let list_tool = tools
+        .iter()
+        .find(|t| t.name == "vikunja_task_reminders_list")
+        .unwrap();
+    assert_eq!(
+        list_tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint),
+        Some(true)
+    );
+    let set_tool = tools
+        .iter()
+        .find(|t| t.name == "vikunja_task_reminders_set")
+        .unwrap();
+    assert_eq!(
+        set_tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.idempotent_hint),
+        Some(true)
     );
     client.cancel().await.unwrap();
 }

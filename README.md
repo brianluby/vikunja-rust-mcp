@@ -158,6 +158,9 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_task_relations_list` | List a task's relations grouped by kind (subtask, blocking, ...). |
 | `vikunja_task_relations_create` | Relate two tasks (blocking, subtask, precedes, ...). |
 | `vikunja_task_relations_delete` | Remove a relation between two tasks. |
+| `vikunja_task_reminders_list` | List a task's reminders. |
+| `vikunja_task_reminders_add` | Add one reminder (absolute time, date shortcut, or relative to a task date). |
+| `vikunja_task_reminders_set` | Replace all reminders; an empty list clears them. |
 | `vikunja_task_comments_list` | List a task's comments. |
 | `vikunja_task_comments_create` | Comment on a task. |
 | `vikunja_task_comments_update` | Edit a comment. |
@@ -175,6 +178,8 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_filters_delete` | Delete a saved filter (tasks are unaffected). |
 | `vikunja_filters_tasks` | List the tasks a saved filter currently matches (paginated). |
 | `vikunja_dates_resolve` | Preview how a date shortcut resolves to RFC 3339 (read-only, never calls Vikunja). |
+| `vikunja_project_views_list` | List a project's views (list/gantt/table/kanban) with their ids. |
+| `vikunja_buckets_list` | List a project's Kanban buckets (lanes) with names and the tasks in each (read-only). |
 
 List tools return `{ items..., "pagination": { page, per_page, total_pages,
 result_count, has_more } }` built from Vikunja's `x-pagination-total-pages`
@@ -242,6 +247,32 @@ task 9 automatically). Supported kinds: `subtask`, `parenttask`, `related`,
 the kind is validated against this list before any request is sent; creating
 a relation that already exists or naming a missing task surfaces the Vikunja
 error (HTTP status and error code) unchanged.
+
+### Task reminders
+
+Vikunja has no dedicated reminder endpoints: reminders live on the task and
+are written by replacing the task's `reminders` array through the same safe
+read-merge-write update as other task fields. The tools cover the full
+lifecycle: `vikunja_task_reminders_list` reads them,
+`vikunja_task_reminders_add` appends one, and `vikunja_task_reminders_set`
+replaces the list (`"reminders": []` removes every reminder).
+
+Each reminder is either **absolute** or **relative**:
+
+- Absolute: `{"reminder": "2026-07-01T09:00:00Z"}`, or a date shortcut
+  (`{"reminder_shortcut": "next friday"}`) resolved exactly like the task
+  date shortcuts below. The `clear` shortcut is rejected here — clear
+  reminders with `vikunja_task_reminders_set` and an empty list.
+- Relative: `{"relative_to": "due_date", "relative_period_seconds": -3600}`
+  fires one hour before the due date (negative = before, positive = after;
+  anchors: `due_date`, `start_date`, `end_date`). Vikunja computes the
+  absolute time itself and re-computes it when the anchor date moves.
+
+Timezone assumptions: absolute RFC 3339 reminders are passed through to
+Vikunja unchanged, offset included. Reminder shortcuts resolve in the
+**server's local timezone** at `VIKUNJA_DATE_DEFAULT_TIME` (see *Smart date
+shortcuts*). Relative reminders have no timezone of their own — they follow
+the anchor date stored on the task.
 
 ### Smart date shortcuts
 
@@ -319,6 +350,7 @@ The `*_bulk_*` tools are deliberately conservative:
 | `vikunja://tasks/recently-updated` | All tasks, most recently updated first (task view). |
 | `vikunja://filters` | All saved filters, with their filter ids and pseudo-project ids. |
 | `vikunja://projects/{id}` | One project (resource template). |
+| `vikunja://projects/{id}/buckets` | Kanban buckets of a project's first kanban view, with their tasks (resource template). |
 | `vikunja://tasks/{id}` | One task (resource template). |
 | `vikunja://filters/{id}` | One saved filter incl. its stored query (resource template). |
 | `vikunja://filters/{id}/tasks` | Tasks matching a saved filter (resource template, capped at 10 pages). |
@@ -373,6 +405,32 @@ pages. The JSON body embeds the view definition and pagination metadata:
 reported more pages. Every view can be replicated (and customized, e.g.
 restricted to one project or paginated past the cap) by calling the
 `vikunja_tasks_list` tool with the same `filter`, `sort_by` and `order_by`.
+
+### Kanban buckets
+
+Vikunja organizes Kanban boards as *project views*: every project has a set
+of views (list, gantt, table, kanban), and the kanban view's lanes are
+*buckets* (e.g. Backlog, Doing, Done). Bucket support here is **read-only**
+and built for answering questions like "which tasks are in the Doing lane?"
+by name instead of by hidden numeric ids:
+
+- `vikunja_project_views_list` lists a project's views with their ids and
+  kinds.
+- `vikunja_buckets_list` (and the `vikunja://projects/{id}/buckets`
+  resource) lists the buckets of a kanban view with each bucket's name,
+  task-count, WIP `limit` (0 = none) and the tasks currently in it. Without
+  `view_id`, the project's **first kanban view** is used; pass `view_id` for
+  projects with several kanban views. When the view definition was fetched
+  (auto-resolution), each bucket also reports `is_default_bucket` /
+  `is_done_bucket`; with an explicit `view_id` those flags are unknown and
+  omitted from the output.
+- Task JSON includes `bucket_id` whenever Vikunja reports it (a `0`/absent
+  value is omitted), so bucket ids can be resolved to names via the bucket
+  listing. Existing task outputs are unchanged otherwise.
+
+Limitations: moving tasks between buckets and creating/renaming/deleting
+buckets are intentionally not exposed; the bucket listing returns one page
+of tasks per bucket (raise `per_page` to see more).
 
 ### Saved filters
 
@@ -498,12 +556,14 @@ entities (cleanup is best-effort).
 
 - **Pre-1.0 instances:** Vikunja < 1.0 used `GET /tasks/all`; this server
   targets the current stable API (`GET /tasks`).
-- **Kanban views/buckets, reminders as first-class tools, reactions,
-  link/user shares, webhooks, notifications, migrations**: out of scope
-  for the core resource set this server exposes. Reminders still appear in
-  task JSON where Vikunja returns them. (Saved filters and task relations
-  *are* supported — see the `vikunja_filters_*` and
-  `vikunja_task_relations_*` tools.)
+- **Reminders as first-class tools, reactions, link/user shares, webhooks,
+  notifications, migrations**: out of scope for the core resource set this
+  server exposes. Reminders still appear in task JSON where Vikunja returns
+  them. (Saved filters, task relations and read-only Kanban buckets *are*
+  supported — see the `vikunja_filters_*`, `vikunja_task_relations_*` and
+  `vikunja_buckets_list` tools.)
+- **Kanban bucket writes** (creating/renaming/deleting buckets, moving
+  tasks between buckets): bucket support is deliberately read-only.
 - **Vikunja's native bulk endpoints** (`/tasks/bulk`, label/assignee bulk):
   not used. Bulk task operations *are* available as the `*_bulk_*` tools
   above, but they fan out over the same per-task endpoints as the

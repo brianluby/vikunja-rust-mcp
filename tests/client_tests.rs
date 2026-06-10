@@ -11,7 +11,7 @@ use vikunja_rust_mcp::error::{ApiErrorKind, Error};
 use vikunja_rust_mcp::vikunja::client::{TaskListOptions, saved_filter_options};
 use vikunja_rust_mcp::vikunja::models::{
     LabelCreate, LabelUpdate, ProjectCreate, ProjectUpdate, RelationKind, SavedFilter,
-    SavedFilterCreate, SavedFilterQuery, SavedFilterUpdate, TaskCreate, TaskUpdate,
+    SavedFilterCreate, SavedFilterQuery, SavedFilterUpdate, TaskCreate, TaskReminder, TaskUpdate,
 };
 use vikunja_rust_mcp::vikunja::pagination::PageParams;
 use wiremock::matchers::{body_json, body_string_contains, header, method, path, query_param};
@@ -1529,4 +1529,262 @@ async fn get_task_decodes_related_tasks() {
     let related = task.related_tasks.expect("related_tasks should be parsed");
     assert_eq!(related["subtask"].len(), 2);
     assert_eq!(related["blocking"][0].id, 9);
+}
+
+// ----- project views & kanban buckets -------------------------------------------
+
+fn view_json(id: i64, title: &str, kind: &str) -> serde_json::Value {
+    json!({
+        "id": id, "title": title, "project_id": 7, "view_kind": kind,
+        "position": 100, "default_bucket_id": 0, "done_bucket_id": 0,
+        "created": "2026-01-01T00:00:00Z", "updated": "2026-01-01T00:00:00Z"
+    })
+}
+
+#[tokio::test]
+async fn list_project_views_decodes_kinds() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            view_json(1, "List", "list"),
+            view_json(4, "Kanban", "kanban"),
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let page = client
+        .list_project_views(7, PageParams::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].view_kind, "list");
+    assert_eq!(page.items[1].view_kind, "kanban");
+    assert_eq!(page.items[1].id, 4);
+    assert_eq!(page.items[1].title, "Kanban");
+}
+
+#[tokio::test]
+async fn list_view_buckets_decodes_buckets_with_tasks() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/views/4/buckets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {
+                "id": 1, "title": "Backlog", "project_view_id": 4,
+                "limit": 0, "count": 1, "position": 100,
+                "tasks": [task_json(11, "Plan the thing", false)]
+            },
+            {
+                "id": 2, "title": "Doing", "project_view_id": 4,
+                "limit": 3, "count": 0, "position": 200,
+                "tasks": null
+            },
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let page = client
+        .list_view_buckets(7, 4, PageParams::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].title, "Backlog");
+    assert_eq!(page.items[0].tasks.as_ref().unwrap()[0].id, 11);
+    assert_eq!(page.items[1].title, "Doing");
+    assert_eq!(page.items[1].limit, 3);
+    assert!(page.items[1].tasks.is_none());
+}
+
+#[tokio::test]
+async fn task_with_bucket_id_round_trips() {
+    let server = MockServer::start().await;
+    let mut with_bucket = task_json(11, "On the board", false);
+    with_bucket["bucket_id"] = json!(2);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/11"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(with_bucket))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let task = client.get_task(11).await.unwrap();
+    assert_eq!(task.bucket_id, Some(2));
+}
+
+// ----- task reminders -----------------------------------------------------------
+
+#[tokio::test]
+async fn update_task_replaces_reminders_via_read_merge_write() {
+    let server = MockServer::start().await;
+    // Current task state: a title to preserve and one old reminder.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep me", "done": false, "project_id": 3,
+            "reminders": [{"reminder": "2026-01-01T09:00:00Z"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The write must contain the merged object: kept title, replaced
+    // reminders array (not appended to).
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "Keep me", "done": false, "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-07-01T09:00:00Z"},
+                {"relative_period": -3600, "relative_to": "due_date"}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep me", "done": false, "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-07-01T09:00:00Z"},
+                {"relative_period": -3600, "relative_to": "due_date"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let patch = TaskUpdate {
+        reminders: Some(vec![
+            TaskReminder {
+                reminder: Some("2026-07-01T09:00:00Z".into()),
+                relative_period: None,
+                relative_to: None,
+            },
+            TaskReminder {
+                reminder: None,
+                relative_period: Some(-3600),
+                relative_to: Some("due_date".into()),
+            },
+        ]),
+        ..Default::default()
+    };
+    let task = client.update_task(9, &patch).await.unwrap();
+    assert_eq!(task.reminders.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn append_task_reminder_uses_single_fetch_and_preserves_unknown_fields() {
+    let server = MockServer::start().await;
+    // Exactly one GET: the appended-to list and the merged write body must
+    // come from the same fetch. The unknown field must survive the write.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3,
+            "some_future_field": {"keep": true},
+            "reminders": [{"reminder": "2026-01-01T09:00:00Z"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3,
+            "some_future_field": {"keep": true},
+            "reminders": [
+                {"reminder": "2026-01-01T09:00:00Z"},
+                {"reminder": "2026-07-01T09:00:00Z"}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-01-01T09:00:00Z"},
+                {"reminder": "2026-07-01T09:00:00Z"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let reminder = TaskReminder {
+        reminder: Some("2026-07-01T09:00:00Z".into()),
+        relative_period: None,
+        relative_to: None,
+    };
+    let task = client.append_task_reminder(9, &reminder).await.unwrap();
+    assert_eq!(task.reminders.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn append_task_reminder_starts_list_when_absent() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": [{"reminder": "2026-07-01T09:00:00Z"}]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": [{"reminder": "2026-07-01T09:00:00Z"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let reminder = TaskReminder {
+        reminder: Some("2026-07-01T09:00:00Z".into()),
+        relative_period: None,
+        relative_to: None,
+    };
+    let task = client.append_task_reminder(9, &reminder).await.unwrap();
+    assert_eq!(task.reminders.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn append_task_reminder_rejects_malformed_reminders_shape() {
+    let server = MockServer::start().await;
+    // A non-array, non-null `reminders` must fail fast instead of being
+    // silently overwritten and written back.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": {"unexpected": "object"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let reminder = TaskReminder {
+        reminder: Some("2026-07-01T09:00:00Z".into()),
+        relative_period: None,
+        relative_to: None,
+    };
+    let err = client.append_task_reminder(9, &reminder).await.unwrap_err();
+    let Error::InvalidResponse { detail, .. } = err else {
+        panic!("expected InvalidResponse, got {err:?}");
+    };
+    assert!(detail.contains("reminders"));
 }
