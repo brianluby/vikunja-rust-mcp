@@ -19,6 +19,9 @@ pub enum ApiErrorKind {
     NotFound,
     /// 400/412/422: Vikunja rejected the request payload.
     Validation,
+    /// 409: the request conflicts with existing state, e.g. a task relation
+    /// that already exists.
+    Conflict,
     /// 429: too many requests.
     RateLimited,
     /// 5xx: Vikunja-side failure.
@@ -34,6 +37,7 @@ impl ApiErrorKind {
             403 => Self::Forbidden,
             404 => Self::NotFound,
             400 | 412 | 422 => Self::Validation,
+            409 => Self::Conflict,
             429 => Self::RateLimited,
             500..=599 => Self::Server,
             _ => Self::Other,
@@ -169,6 +173,9 @@ impl Error {
                             "Vikunja rejected the request (HTTP {status}) in {endpoint}: {message}"
                         )
                     }
+                    ApiErrorKind::Conflict => {
+                        format!("Vikunja reported a conflict (HTTP 409) in {endpoint}: {message}")
+                    }
                     ApiErrorKind::RateLimited => format!(
                         "Vikunja rate limit hit (HTTP 429) while calling {endpoint}: {message}. Retry later."
                     ),
@@ -177,7 +184,7 @@ impl Error {
                     ),
                 };
                 match kind {
-                    ApiErrorKind::NotFound | ApiErrorKind::Validation => {
+                    ApiErrorKind::NotFound | ApiErrorKind::Validation | ApiErrorKind::Conflict => {
                         McpError::invalid_params(text, data)
                     }
                     _ => McpError::internal_error(text, data),
@@ -259,6 +266,7 @@ mod tests {
         assert_eq!(ApiErrorKind::from_status(400), ApiErrorKind::Validation);
         assert_eq!(ApiErrorKind::from_status(412), ApiErrorKind::Validation);
         assert_eq!(ApiErrorKind::from_status(422), ApiErrorKind::Validation);
+        assert_eq!(ApiErrorKind::from_status(409), ApiErrorKind::Conflict);
         assert_eq!(ApiErrorKind::from_status(429), ApiErrorKind::RateLimited);
         assert_eq!(ApiErrorKind::from_status(500), ApiErrorKind::Server);
         assert_eq!(ApiErrorKind::from_status(503), ApiErrorKind::Server);
