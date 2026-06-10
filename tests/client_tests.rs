@@ -1105,9 +1105,12 @@ async fn list_all_tasks_with_options_forwards_query_and_reports_metadata() {
         .list_all_tasks_with_options(&options, 10)
         .await
         .unwrap();
-    assert_eq!(result.tasks.len(), 2);
+    assert_eq!(result.items.len(), 2);
     assert_eq!(result.pages_read, 2);
+    assert_eq!(result.page_cap, 10);
     assert!(!result.truncated);
+    assert_eq!(result.last_info.page, 2);
+    assert_eq!(result.last_info.total_pages, Some(2));
 }
 
 #[tokio::test]
@@ -1132,9 +1135,46 @@ async fn list_all_tasks_with_options_reports_truncation_at_cap() {
         .list_all_tasks_with_options(&TaskListOptions::default(), 2)
         .await
         .unwrap();
-    assert_eq!(result.tasks.len(), 2);
+    assert_eq!(result.items.len(), 2);
     assert_eq!(result.pages_read, 2);
+    assert_eq!(result.page_cap, 2);
     assert!(result.truncated, "cap hit with more pages must truncate");
+}
+
+#[tokio::test]
+async fn list_all_tasks_with_options_handles_null_page_bodies() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::Value::Null)
+                .insert_header("x-pagination-total-pages", "2"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("page", "2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([task_json(1, "t", false)]))
+                .insert_header("x-pagination-total-pages", "2"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let result = client
+        .list_all_tasks_with_options(&TaskListOptions::default(), 10)
+        .await
+        .unwrap();
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.pages_read, 2);
+    assert!(!result.truncated);
 }
 
 #[tokio::test]

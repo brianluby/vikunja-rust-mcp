@@ -124,12 +124,12 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 
 | Tool | Description |
 |---|---|
-| `vikunja_projects_list` | List/search projects (paginated, `is_archived` filter). |
+| `vikunja_projects_list` | List/search projects (paginated, `is_archived` filter, optional auto-pagination). |
 | `vikunja_projects_get` | Get one project. |
 | `vikunja_projects_create` | Create a project. |
 | `vikunja_projects_update` | Partially update a project (incl. archive/unarchive). |
 | `vikunja_projects_delete` | Delete a project and its tasks. |
-| `vikunja_tasks_list` | List/search tasks; optional `project_id`, Vikunja `filter` expression, `sort_by`/`order_by`. |
+| `vikunja_tasks_list` | List/search tasks; optional `project_id`, Vikunja `filter` expression, `sort_by`/`order_by`, auto-pagination. |
 | `vikunja_tasks_get` | Get one task with labels and assignees. |
 | `vikunja_tasks_create` | Create a task in a project (RFC 3339 dates or `*_shortcut` date shortcuts). |
 | `vikunja_tasks_update` | Partially update a task (incl. moving projects; dates also via `*_shortcut`). |
@@ -146,7 +146,7 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_tasks_bulk_unassign` | Remove one user from several tasks (explicit ids, per-task results). |
 | `vikunja_task_labels_bulk_add` | Add one label to several tasks (explicit ids, per-task results). |
 | `vikunja_task_labels_bulk_remove` | Remove one label from several tasks (explicit ids, per-task results). |
-| `vikunja_labels_list` | List/search labels (paginated). |
+| `vikunja_labels_list` | List/search labels (paginated, optional auto-pagination). |
 | `vikunja_labels_create` | Create a label. |
 | `vikunja_labels_update` | Partially update a label. |
 | `vikunja_labels_delete` | Delete a label. |
@@ -159,12 +159,12 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_task_comments_create` | Comment on a task. |
 | `vikunja_task_comments_update` | Edit a comment. |
 | `vikunja_task_comments_delete` | Delete a comment. |
-| `vikunja_task_attachments_list` | List a task's attachments. |
+| `vikunja_task_attachments_list` | List a task's attachments (paginated, optional auto-pagination). |
 | `vikunja_task_attachments_upload` | Upload an attachment (base64 content or a server-local file path). |
 | `vikunja_task_attachments_download` | Download an attachment (inline base64 up to 2 MiB, or save to a server-local path). |
 | `vikunja_task_attachments_delete` | Delete an attachment. |
 | `vikunja_users_search` | Search users (for assignment). |
-| `vikunja_teams_list` | List teams; with `project_id`, list the teams that can access that project including their permission level. |
+| `vikunja_teams_list` | List teams; with `project_id`, list the teams that can access that project including their permission level. Optional auto-pagination. |
 | `vikunja_filters_list` | List saved filters (durable, named task queries). |
 | `vikunja_filters_get` | Get one saved filter incl. its stored query. |
 | `vikunja_filters_create` | Create a saved filter from a filter expression + sort order. |
@@ -178,6 +178,46 @@ result_count, has_more } }` built from Vikunja's `x-pagination-total-pages`
 and `x-pagination-result-count` headers; pass `page`/`per_page` to walk
 further pages. Task filters use [Vikunja filter syntax](https://vikunja.io/docs/filters),
 e.g. `done = false && due_date < now/d+7d`.
+
+### Auto-pagination (bounded list-all)
+
+The paginated list tools — `vikunja_projects_list`, `vikunja_tasks_list`,
+`vikunja_labels_list`, `vikunja_task_attachments_list` and
+`vikunja_teams_list` (including its `project_id` project-teams form) — also
+accept:
+
+- `auto_paginate` (bool): fetch multiple pages starting at page 1 and return
+  them as one result. Cannot be combined with `page` (use `per_page` to
+  control the page size that is walked).
+- `max_pages` (1–50, default **10**): how many pages may be fetched at most.
+  Requires `auto_paginate: true`; values outside 1–50 are rejected before
+  any request is made. There is no unbounded mode — the **absolute cap is 50
+  pages** per call.
+
+All other arguments (`search`, `filter`, `project_id`, `sort_by`,
+`order_by`, `is_archived`, ...) apply unchanged to every fetched page.
+Auto-paginated responses add an `auto_pagination` block and report the last
+fetched page in `pagination`:
+
+```json
+{
+  "tasks": [ ... ],
+  "pagination": { "page": 3, "total_pages": 7, "has_more": true },
+  "auto_pagination": { "pages_read": 3, "page_cap": 3, "truncated": true, "count": 150 }
+}
+```
+
+`truncated: true` means the page cap was hit while the server still reported
+more pages — the result is incomplete; re-run with a narrower filter or a
+higher `max_pages`. It is only set when the server explicitly reported more
+pages via its pagination headers; when a server sends no pagination headers,
+the walk stops after the first page with `truncated: false`. Without
+`auto_paginate`, responses keep their original one-page shape and contain no
+`auto_pagination` block.
+
+Not auto-paginated: `vikunja_task_comments_list` (Vikunja does not paginate
+comments — it always returns the full list) and `vikunja_users_search` (the
+users endpoint is a search, not a paginated listing).
 
 ### Update semantics (read-merge-write)
 

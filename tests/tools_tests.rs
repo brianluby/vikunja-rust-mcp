@@ -3007,3 +3007,355 @@ async fn task_relations_create_surfaces_already_exists_error() {
     assert_eq!(details["endpoint"], "task_relations.create");
     client.cancel().await.unwrap();
 }
+
+// ----- auto-pagination through the tool layer ---------------------------------
+
+/// Mounts one page of a paginated list endpoint that reports `total` pages.
+async fn mount_page(
+    server: &MockServer,
+    endpoint_path: &str,
+    page: u32,
+    total: u32,
+    body: serde_json::Value,
+) {
+    Mock::given(method("GET"))
+        .and(path(endpoint_path))
+        .and(query_param("page", page.to_string()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .insert_header("x-pagination-total-pages", total.to_string()),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn list_tools_publish_auto_pagination_args() {
+    let client = connect("http://127.0.0.1:1").await;
+    let tools = client.list_all_tools().await.unwrap();
+    for name in [
+        "vikunja_projects_list",
+        "vikunja_tasks_list",
+        "vikunja_labels_list",
+        "vikunja_task_attachments_list",
+        "vikunja_teams_list",
+    ] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        let schema = serde_json::to_value(&tool.input_schema).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        for arg in ["auto_paginate", "max_pages"] {
+            assert!(
+                properties.contains_key(arg),
+                "tool {name} is missing the {arg} argument"
+            );
+        }
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn tasks_list_auto_paginate_walks_pages_preserving_args() {
+    let server = MockServer::start().await;
+    for page in 1..=2u32 {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tasks"))
+            .and(query_param("page", page.to_string()))
+            .and(query_param("per_page", "2"))
+            .and(query_param("s", "report"))
+            .and(query_param("filter", "(done = false) && project_id = 4"))
+            .and(query_param("sort_by", "priority"))
+            .and(query_param("order_by", "desc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([{"id": page, "title": format!("T{page}"), "done": false, "project_id": 4}]))
+                    .insert_header("x-pagination-total-pages", "2"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_tasks_list",
+        json!({
+            "auto_paginate": true,
+            "per_page": 2,
+            "search": "report",
+            "filter": "done = false",
+            "project_id": 4,
+            "sort_by": "priority",
+            "order_by": "desc"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["tasks"].as_array().unwrap().len(), 2);
+    assert_eq!(body["tasks"][1]["title"], "T2");
+    assert_eq!(body["auto_pagination"]["pages_read"], 2);
+    assert_eq!(body["auto_pagination"]["page_cap"], 10);
+    assert_eq!(body["auto_pagination"]["truncated"], false);
+    assert_eq!(body["auto_pagination"]["count"], 2);
+    assert_eq!(body["pagination"]["page"], 2);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn projects_list_auto_paginate_reports_truncation_at_cap() {
+    let server = MockServer::start().await;
+    for page in 1..=2u32 {
+        mount_page(
+            &server,
+            "/api/v1/projects",
+            page,
+            5,
+            json!([{"id": page, "title": format!("P{page}")}]),
+        )
+        .await;
+    }
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_projects_list",
+        json!({"auto_paginate": true, "max_pages": 2}),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["projects"].as_array().unwrap().len(), 2);
+    assert_eq!(body["auto_pagination"]["pages_read"], 2);
+    assert_eq!(body["auto_pagination"]["page_cap"], 2);
+    assert_eq!(body["auto_pagination"]["truncated"], true);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn labels_list_auto_paginate_walks_pages() {
+    let server = MockServer::start().await;
+    for page in 1..=2u32 {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/labels"))
+            .and(query_param("page", page.to_string()))
+            .and(query_param("s", "urgent"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([{"id": page, "title": format!("L{page}")}]))
+                    .insert_header("x-pagination-total-pages", "2"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_labels_list",
+        json!({"auto_paginate": true, "search": "urgent"}),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["labels"].as_array().unwrap().len(), 2);
+    assert_eq!(body["auto_pagination"]["pages_read"], 2);
+    assert_eq!(body["auto_pagination"]["truncated"], false);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn attachments_list_auto_paginate_walks_pages() {
+    let server = MockServer::start().await;
+    for page in 1..=2u32 {
+        mount_page(
+            &server,
+            "/api/v1/tasks/7/attachments",
+            page,
+            2,
+            json!([{"id": page, "task_id": 7}]),
+        )
+        .await;
+    }
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_attachments_list",
+        json!({"task_id": 7, "auto_paginate": true}),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["attachments"].as_array().unwrap().len(), 2);
+    assert_eq!(body["auto_pagination"]["pages_read"], 2);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn teams_list_auto_paginate_walks_pages() {
+    let server = MockServer::start().await;
+    for page in 1..=2u32 {
+        mount_page(
+            &server,
+            "/api/v1/teams",
+            page,
+            2,
+            json!([{"id": page, "name": format!("team{page}")}]),
+        )
+        .await;
+    }
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_teams_list",
+        json!({"auto_paginate": true}),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["teams"].as_array().unwrap().len(), 2);
+    assert_eq!(body["auto_pagination"]["pages_read"], 2);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_teams_list_auto_paginate_walks_pages() {
+    let server = MockServer::start().await;
+    for page in 1..=2u32 {
+        mount_page(
+            &server,
+            "/api/v1/projects/5/teams",
+            page,
+            2,
+            json!([{"id": page, "name": format!("team{page}"), "permission": 1}]),
+        )
+        .await;
+    }
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_teams_list",
+        json!({"project_id": 5, "auto_paginate": true}),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["teams"].as_array().unwrap().len(), 2);
+    assert_eq!(body["teams"][0]["permission"], 1);
+    assert_eq!(body["auto_pagination"]["pages_read"], 2);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn auto_pagination_validation_rejects_bad_arguments_before_any_request() {
+    // The unreachable server makes any HTTP attempt fail loudly, so an
+    // invalid-params error proves validation fired first.
+    let client = connect("http://127.0.0.1:1").await;
+
+    let cases = [
+        (
+            "vikunja_tasks_list",
+            json!({"auto_paginate": true, "max_pages": 0}),
+            "max_pages",
+        ),
+        (
+            "vikunja_tasks_list",
+            json!({"auto_paginate": true, "max_pages": 51}),
+            "max_pages",
+        ),
+        (
+            "vikunja_tasks_list",
+            json!({"max_pages": 3}),
+            "auto_paginate",
+        ),
+        (
+            "vikunja_tasks_list",
+            json!({"auto_paginate": false, "max_pages": 3}),
+            "auto_paginate",
+        ),
+        (
+            "vikunja_tasks_list",
+            json!({"auto_paginate": true, "page": 2}),
+            "page",
+        ),
+        (
+            "vikunja_projects_list",
+            json!({"auto_paginate": true, "max_pages": 0}),
+            "max_pages",
+        ),
+        (
+            "vikunja_labels_list",
+            json!({"auto_paginate": true, "max_pages": 99}),
+            "max_pages",
+        ),
+        (
+            "vikunja_teams_list",
+            json!({"max_pages": 3}),
+            "auto_paginate",
+        ),
+        (
+            "vikunja_task_attachments_list",
+            json!({"task_id": 7, "auto_paginate": true, "page": 2}),
+            "page",
+        ),
+    ];
+    for (tool, args, needle) in cases {
+        let err = call(&client, tool, args.clone()).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error for {tool} {args}");
+        };
+        assert_eq!(
+            data.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "{tool} {args}"
+        );
+        assert!(
+            data.message.contains(needle),
+            "{tool} {args}: {}",
+            data.message
+        );
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn one_page_lists_omit_auto_pagination_metadata() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 1, "title": "Inbox"}]))
+                .insert_header("x-pagination-total-pages", "3"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    // No auto_paginate: exactly one page is fetched and the response keeps
+    // its original shape, without any auto_pagination block.
+    let result = call(&client, "vikunja_projects_list", json!({}))
+        .await
+        .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["projects"].as_array().unwrap().len(), 1);
+    assert_eq!(body["pagination"]["has_more"], true);
+    assert!(
+        body.get("auto_pagination").is_none(),
+        "one-page responses must not grow an auto_pagination block: {body}"
+    );
+    client.cancel().await.unwrap();
+}
