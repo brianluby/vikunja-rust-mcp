@@ -7,9 +7,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ErrorData as McpError, tool, tool_router};
 use schemars::JsonSchema;
+use schemars::transform::RecursiveTransform;
 use serde::{Deserialize, Serialize};
 
-use crate::error::Error;
+use crate::error::{ApiErrorKind, Error};
+use crate::schema::strip_unsigned_formats;
 use crate::vikunja::client::TaskListOptions;
 use crate::vikunja::models::{
     Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, Task, TaskAttachment,
@@ -24,10 +26,15 @@ use super::server::VikunjaMcpServer;
 pub const MAX_INLINE_DOWNLOAD_BYTES: usize = 2 * 1024 * 1024;
 /// Largest accepted upload (decoded bytes).
 pub const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
+/// Largest number of task ids accepted by one bulk tool call. Bounds the
+/// fan-out (each id can cost several Vikunja requests) so a single MCP call
+/// cannot flood the instance or hold the connection open indefinitely.
+pub const MAX_BULK_TASK_IDS: usize = 100;
 
 // ----- Shared argument/output shapes ----------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct ProjectsListArgs {
     /// Search projects by title.
     pub search: Option<String>,
@@ -82,6 +89,7 @@ pub struct ProjectsUpdateArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct TasksListArgs {
     /// 1-based page number (default 1).
     pub page: Option<u32>,
@@ -171,6 +179,73 @@ pub struct TaskUserArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct BulkTaskIdsArgs {
+    /// Numeric ids of the tasks to operate on. Must be non-empty, all
+    /// positive, and at most 100 ids per call.
+    pub task_ids: Vec<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TasksBulkUpdateArgs {
+    /// Numeric ids of the tasks to update. Must be non-empty, all positive,
+    /// and at most 100 ids per call.
+    pub task_ids: Vec<i64>,
+    /// New title.
+    pub title: Option<String>,
+    /// New description.
+    pub description: Option<String>,
+    /// Set done state. Prefer vikunja_tasks_bulk_complete /
+    /// vikunja_tasks_bulk_reopen.
+    pub done: Option<bool>,
+    /// New due date as RFC 3339; `0001-01-01T00:00:00Z` clears it.
+    pub due_date: Option<String>,
+    /// New start date as RFC 3339.
+    pub start_date: Option<String>,
+    /// New end date as RFC 3339.
+    pub end_date: Option<String>,
+    /// Priority: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 DO NOW.
+    pub priority: Option<i64>,
+    /// Completion fraction between 0 and 1.
+    pub percent_done: Option<f64>,
+    /// Move the tasks to another project.
+    pub project_id: Option<i64>,
+    /// New hex color without the leading `#`.
+    pub hex_color: Option<String>,
+    /// Favorite (true) or unfavorite (false).
+    pub is_favorite: Option<bool>,
+    /// Repeat interval in seconds.
+    pub repeat_after: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TasksBulkMoveArgs {
+    /// Numeric ids of the tasks to move. Must be non-empty, all positive,
+    /// and at most 100 ids per call.
+    pub task_ids: Vec<i64>,
+    /// Id of the project to move all listed tasks to.
+    pub project_id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BulkTaskLabelArgs {
+    /// Numeric ids of the tasks. Must be non-empty, all positive, and at
+    /// most 100 ids per call.
+    pub task_ids: Vec<i64>,
+    /// Numeric id of the label (find it with vikunja_labels_list).
+    pub label_id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BulkTaskUserArgs {
+    /// Numeric ids of the tasks. Must be non-empty, all positive, and at
+    /// most 100 ids per call.
+    pub task_ids: Vec<i64>,
+    /// Numeric id of the user (find it with vikunja_users_search).
+    pub user_id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct LabelsListArgs {
     /// Search labels by title.
     pub search: Option<String>,
@@ -243,6 +318,7 @@ pub struct CommentIdArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct AttachmentsListArgs {
     /// Numeric id of the task.
     pub task_id: i64,
@@ -296,6 +372,7 @@ pub struct UsersSearchArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct TeamsListArgs {
     /// Search teams by name.
     pub search: Option<String>,
@@ -355,6 +432,88 @@ pub struct OperationResult {
     pub message: String,
 }
 
+/// Result of a bulk task operation: aggregate counts plus one entry per
+/// requested task id, in input order.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct BulkOperationResult {
+    /// True only when every task succeeded (`failed == 0`).
+    pub ok: bool,
+    /// Number of task ids processed.
+    pub total: usize,
+    /// Number of tasks that succeeded.
+    pub succeeded: usize,
+    /// Number of tasks that failed.
+    pub failed: usize,
+    /// Per-task outcomes, in the same order as the requested `task_ids`.
+    pub results: Vec<BulkTaskResult>,
+}
+
+/// Outcome of one task within a bulk operation.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BulkTaskResult {
+    pub task_id: i64,
+    pub ok: bool,
+    /// Operation applied, e.g. `complete`, `update`, `label_add`.
+    pub operation: String,
+    /// The resulting task, for operations that return the task.
+    pub task: Option<Task>,
+    /// Confirmation message, for operations that do not return a task.
+    pub message: Option<String>,
+    /// Failure detail when `ok` is false.
+    pub error: Option<BulkItemError>,
+}
+
+/// Structured error detail for one failed item of a bulk operation. Carries
+/// the same safe fields as MCP error data — never tokens or headers.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct BulkItemError {
+    /// Error category: `auth`, `forbidden`, `not_found`, `validation`,
+    /// `rate_limited`, `server`, `network`, `timeout`, `invalid_response`,
+    /// `io`, `too_large`, `invalid_argument` or `other`.
+    pub kind: String,
+    /// HTTP status reported by Vikunja, when the API answered.
+    pub http_status: Option<u16>,
+    /// Vikunja-specific error code from the response body, if present.
+    pub vikunja_error_code: Option<i64>,
+    /// Human-readable description of the failure.
+    pub message: String,
+}
+
+impl BulkItemError {
+    fn from_error(err: &Error) -> Self {
+        let (kind, http_status, vikunja_error_code) = match err {
+            Error::Api {
+                status, kind, code, ..
+            } => {
+                let kind = match kind {
+                    ApiErrorKind::Auth => "auth",
+                    ApiErrorKind::Forbidden => "forbidden",
+                    ApiErrorKind::NotFound => "not_found",
+                    ApiErrorKind::Validation => "validation",
+                    ApiErrorKind::RateLimited => "rate_limited",
+                    ApiErrorKind::Server => "server",
+                    ApiErrorKind::Other => "other",
+                };
+                (kind, Some(*status), *code)
+            }
+            Error::Network { .. } => ("network", None, None),
+            Error::Timeout { .. } => ("timeout", None, None),
+            Error::InvalidResponse { .. } => ("invalid_response", None, None),
+            Error::Io { .. } => ("io", None, None),
+            Error::TooLarge { .. } => ("too_large", None, None),
+            Error::InvalidArgument(_) => ("invalid_argument", None, None),
+        };
+        Self {
+            kind: kind.to_string(),
+            http_status,
+            vikunja_error_code,
+            message: err.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct UploadResult {
     pub ok: bool,
@@ -364,6 +523,7 @@ pub struct UploadResult {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct DownloadResult {
     pub task_id: i64,
     pub attachment_id: i64,
@@ -400,6 +560,81 @@ fn non_empty(name: &str, value: &str) -> Result<(), McpError> {
         return Err(Error::InvalidArgument(format!("{name} must not be empty")).to_mcp());
     }
     Ok(())
+}
+
+/// Validates the id list of a bulk operation before any write is issued.
+fn validate_task_ids(task_ids: &[i64]) -> Result<(), McpError> {
+    if task_ids.is_empty() {
+        return Err(Error::InvalidArgument("task_ids must not be empty".to_string()).to_mcp());
+    }
+    if task_ids.len() > MAX_BULK_TASK_IDS {
+        return Err(Error::InvalidArgument(format!(
+            "task_ids has {} entries; at most {MAX_BULK_TASK_IDS} tasks are allowed per bulk call — split the batch",
+            task_ids.len()
+        ))
+        .to_mcp());
+    }
+    if task_ids.iter().any(|&id| id <= 0) {
+        return Err(Error::InvalidArgument(
+            "task_ids must contain only positive integers".to_string(),
+        )
+        .to_mcp());
+    }
+    Ok(())
+}
+
+/// What one successful bulk item produced.
+enum BulkOutcome {
+    Task(Box<Task>),
+    Message(String),
+}
+
+/// Runs `op` for each task id in turn, collecting per-task outcomes. A
+/// failing item is recorded and does not abort the remaining items; writes
+/// are never retried (the underlying client only retries idempotent GETs).
+async fn run_bulk<F, Fut>(task_ids: Vec<i64>, operation: &str, op: F) -> Json<BulkOperationResult>
+where
+    F: Fn(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<BulkOutcome, Error>>,
+{
+    let mut results = Vec::with_capacity(task_ids.len());
+    for task_id in task_ids {
+        results.push(match op(task_id).await {
+            Ok(BulkOutcome::Task(task)) => BulkTaskResult {
+                task_id,
+                ok: true,
+                operation: operation.to_string(),
+                task: Some(*task),
+                message: None,
+                error: None,
+            },
+            Ok(BulkOutcome::Message(message)) => BulkTaskResult {
+                task_id,
+                ok: true,
+                operation: operation.to_string(),
+                task: None,
+                message: Some(message),
+                error: None,
+            },
+            Err(err) => BulkTaskResult {
+                task_id,
+                ok: false,
+                operation: operation.to_string(),
+                task: None,
+                message: None,
+                error: Some(BulkItemError::from_error(&err)),
+            },
+        });
+    }
+    let total = results.len();
+    let succeeded = results.iter().filter(|r| r.ok).count();
+    Json(BulkOperationResult {
+        ok: succeeded == total,
+        total,
+        succeeded,
+        failed: total - succeeded,
+        results,
+    })
 }
 
 fn oversized_upload(size: usize) -> Error {
@@ -680,6 +915,214 @@ impl VikunjaMcpServer {
             ok: true,
             message: message.message,
         }))
+    }
+
+    // -- Bulk task operations --
+    //
+    // All bulk tools take an explicit, validated list of task ids (no
+    // filter-based selection), fan out over the same safe per-task client
+    // calls as the single-task tools, and report per-task results: after
+    // argument validation passes, one failing task never fails the call.
+
+    #[tool(
+        name = "vikunja_tasks_bulk_complete",
+        description = "Mark several Vikunja tasks as done in one call. Takes explicit task ids only and returns per-task results; a failing task does not abort the rest.",
+        annotations(idempotent_hint = true)
+    )]
+    pub async fn tasks_bulk_complete(
+        &self,
+        Parameters(args): Parameters<BulkTaskIdsArgs>,
+    ) -> Result<Json<BulkOperationResult>, McpError> {
+        validate_task_ids(&args.task_ids)?;
+        Ok(run_bulk(args.task_ids, "complete", |task_id| async move {
+            self.client()
+                .set_task_done(task_id, true)
+                .await
+                .map(|task| BulkOutcome::Task(Box::new(task)))
+        })
+        .await)
+    }
+
+    #[tool(
+        name = "vikunja_tasks_bulk_reopen",
+        description = "Mark several done Vikunja tasks as not done in one call. Takes explicit task ids only and returns per-task results; a failing task does not abort the rest.",
+        annotations(idempotent_hint = true)
+    )]
+    pub async fn tasks_bulk_reopen(
+        &self,
+        Parameters(args): Parameters<BulkTaskIdsArgs>,
+    ) -> Result<Json<BulkOperationResult>, McpError> {
+        validate_task_ids(&args.task_ids)?;
+        Ok(run_bulk(args.task_ids, "reopen", |task_id| async move {
+            self.client()
+                .set_task_done(task_id, false)
+                .await
+                .map(|task| BulkOutcome::Task(Box::new(task)))
+        })
+        .await)
+    }
+
+    #[tool(
+        name = "vikunja_tasks_bulk_update",
+        description = "Apply one partial update to several Vikunja tasks. Takes explicit task ids only; provided fields change on every listed task, others keep their value. Returns per-task results; a failing task does not abort the rest.",
+        annotations(idempotent_hint = true)
+    )]
+    pub async fn tasks_bulk_update(
+        &self,
+        Parameters(args): Parameters<TasksBulkUpdateArgs>,
+    ) -> Result<Json<BulkOperationResult>, McpError> {
+        validate_task_ids(&args.task_ids)?;
+        if let Some(project_id) = args.project_id {
+            positive("project_id", project_id)?;
+        }
+        let patch = TaskUpdate {
+            title: args.title,
+            description: args.description,
+            done: args.done,
+            due_date: args.due_date,
+            start_date: args.start_date,
+            end_date: args.end_date,
+            priority: args.priority,
+            percent_done: args.percent_done,
+            project_id: args.project_id,
+            hex_color: args.hex_color,
+            is_favorite: args.is_favorite,
+            repeat_after: args.repeat_after,
+        };
+        // Reject an empty patch up front instead of failing every item.
+        let patch_value = serde_json::to_value(&patch).map_err(|e| {
+            Error::InvalidResponse {
+                endpoint: "tasks.update",
+                detail: format!("failed to serialize update payload: {e}"),
+            }
+            .to_mcp()
+        })?;
+        if patch_value
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty)
+        {
+            return Err(Error::InvalidArgument(
+                "nothing to update: provide at least one field".to_string(),
+            )
+            .to_mcp());
+        }
+        Ok(run_bulk(args.task_ids, "update", |task_id| {
+            let patch = &patch;
+            async move {
+                self.client()
+                    .update_task(task_id, patch)
+                    .await
+                    .map(|task| BulkOutcome::Task(Box::new(task)))
+            }
+        })
+        .await)
+    }
+
+    #[tool(
+        name = "vikunja_tasks_bulk_move",
+        description = "Move several Vikunja tasks to another project. Takes explicit task ids only and returns per-task results; a failing task does not abort the rest.",
+        annotations(idempotent_hint = true)
+    )]
+    pub async fn tasks_bulk_move(
+        &self,
+        Parameters(args): Parameters<TasksBulkMoveArgs>,
+    ) -> Result<Json<BulkOperationResult>, McpError> {
+        validate_task_ids(&args.task_ids)?;
+        let project_id = positive("project_id", args.project_id)?;
+        let patch = TaskUpdate {
+            project_id: Some(project_id),
+            ..Default::default()
+        };
+        Ok(run_bulk(args.task_ids, "move", |task_id| {
+            let patch = &patch;
+            async move {
+                self.client()
+                    .update_task(task_id, patch)
+                    .await
+                    .map(|task| BulkOutcome::Task(Box::new(task)))
+            }
+        })
+        .await)
+    }
+
+    #[tool(
+        name = "vikunja_task_labels_bulk_add",
+        description = "Add one existing label to several Vikunja tasks. Takes explicit task ids only and returns per-task results; a failing task does not abort the rest."
+    )]
+    pub async fn task_labels_bulk_add(
+        &self,
+        Parameters(args): Parameters<BulkTaskLabelArgs>,
+    ) -> Result<Json<BulkOperationResult>, McpError> {
+        validate_task_ids(&args.task_ids)?;
+        let label_id = positive("label_id", args.label_id)?;
+        Ok(run_bulk(args.task_ids, "label_add", |task_id| async move {
+            self.client()
+                .add_task_label(task_id, label_id)
+                .await
+                .map(|_| BulkOutcome::Message(format!("label {label_id} added to task {task_id}")))
+        })
+        .await)
+    }
+
+    #[tool(
+        name = "vikunja_task_labels_bulk_remove",
+        description = "Remove one label from several Vikunja tasks. Takes explicit task ids only and returns per-task results; a failing task does not abort the rest.",
+        annotations(destructive_hint = true)
+    )]
+    pub async fn task_labels_bulk_remove(
+        &self,
+        Parameters(args): Parameters<BulkTaskLabelArgs>,
+    ) -> Result<Json<BulkOperationResult>, McpError> {
+        validate_task_ids(&args.task_ids)?;
+        let label_id = positive("label_id", args.label_id)?;
+        Ok(
+            run_bulk(args.task_ids, "label_remove", |task_id| async move {
+                self.client()
+                    .remove_task_label(task_id, label_id)
+                    .await
+                    .map(|message| BulkOutcome::Message(message.message))
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        name = "vikunja_tasks_bulk_assign",
+        description = "Assign one user to several Vikunja tasks. Takes explicit task ids only and returns per-task results; a failing task does not abort the rest. Find user ids with vikunja_users_search."
+    )]
+    pub async fn tasks_bulk_assign(
+        &self,
+        Parameters(args): Parameters<BulkTaskUserArgs>,
+    ) -> Result<Json<BulkOperationResult>, McpError> {
+        validate_task_ids(&args.task_ids)?;
+        let user_id = positive("user_id", args.user_id)?;
+        Ok(run_bulk(args.task_ids, "assign", |task_id| async move {
+            self.client()
+                .assign_user(task_id, user_id)
+                .await
+                .map(|_| BulkOutcome::Message(format!("user {user_id} assigned to task {task_id}")))
+        })
+        .await)
+    }
+
+    #[tool(
+        name = "vikunja_tasks_bulk_unassign",
+        description = "Remove one user's assignment from several Vikunja tasks. Takes explicit task ids only and returns per-task results; a failing task does not abort the rest.",
+        annotations(destructive_hint = true)
+    )]
+    pub async fn tasks_bulk_unassign(
+        &self,
+        Parameters(args): Parameters<BulkTaskUserArgs>,
+    ) -> Result<Json<BulkOperationResult>, McpError> {
+        validate_task_ids(&args.task_ids)?;
+        let user_id = positive("user_id", args.user_id)?;
+        Ok(run_bulk(args.task_ids, "unassign", |task_id| async move {
+            self.client()
+                .unassign_user(task_id, user_id)
+                .await
+                .map(|message| BulkOutcome::Message(message.message))
+        })
+        .await)
     }
 
     // -- Labels --
@@ -1117,5 +1560,117 @@ impl VikunjaMcpServer {
             teams: page.items,
             pagination: page.info,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_item_error_maps_api_errors_with_status_and_code() {
+        let err = Error::Api {
+            endpoint: "tasks.update",
+            status: 404,
+            kind: ApiErrorKind::NotFound,
+            code: Some(4002),
+            message: "The task does not exist.".to_string(),
+        };
+        let detail = BulkItemError::from_error(&err);
+        assert_eq!(detail.kind, "not_found");
+        assert_eq!(detail.http_status, Some(404));
+        assert_eq!(detail.vikunja_error_code, Some(4002));
+        assert!(detail.message.contains("does not exist"));
+    }
+
+    #[test]
+    fn bulk_item_error_covers_every_api_kind() {
+        for (status, expected) in [
+            (401u16, "auth"),
+            (403, "forbidden"),
+            (404, "not_found"),
+            (400, "validation"),
+            (412, "validation"),
+            (422, "validation"),
+            (429, "rate_limited"),
+            (500, "server"),
+            (418, "other"),
+        ] {
+            let detail =
+                BulkItemError::from_error(&Error::from_status("tasks.update", status, b""));
+            assert_eq!(detail.kind, expected, "status {status}");
+            assert_eq!(detail.http_status, Some(status));
+        }
+    }
+
+    #[test]
+    fn bulk_item_error_maps_non_api_errors_without_status() {
+        let cases: Vec<(Error, &str)> = vec![
+            (
+                Error::Network {
+                    endpoint: "tasks.update",
+                    detail: "connection failed".to_string(),
+                },
+                "network",
+            ),
+            (
+                Error::Timeout {
+                    endpoint: "tasks.update",
+                },
+                "timeout",
+            ),
+            (
+                Error::InvalidResponse {
+                    endpoint: "tasks.update",
+                    detail: "expected JSON".to_string(),
+                },
+                "invalid_response",
+            ),
+            (
+                Error::Io {
+                    detail: "permission denied".to_string(),
+                },
+                "io",
+            ),
+            (
+                Error::TooLarge {
+                    endpoint: "attachments.download",
+                    size: Some(5),
+                    limit: 2,
+                },
+                "too_large",
+            ),
+            (
+                Error::InvalidArgument("nope".to_string()),
+                "invalid_argument",
+            ),
+        ];
+        for (err, expected) in cases {
+            let detail = BulkItemError::from_error(&err);
+            assert_eq!(detail.kind, expected);
+            assert_eq!(detail.http_status, None);
+            assert_eq!(detail.vikunja_error_code, None);
+            assert!(!detail.message.is_empty());
+        }
+    }
+
+    #[test]
+    fn validate_task_ids_accepts_positive_ids_only() {
+        assert!(validate_task_ids(&[1, 2, 3]).is_ok());
+        assert!(validate_task_ids(&[]).is_err());
+        assert!(validate_task_ids(&[0]).is_err());
+        assert!(validate_task_ids(&[5, -1]).is_err());
+    }
+
+    #[test]
+    fn validate_task_ids_enforces_batch_cap() {
+        let at_cap: Vec<i64> = (1..=MAX_BULK_TASK_IDS as i64).collect();
+        assert!(validate_task_ids(&at_cap).is_ok());
+
+        let over_cap: Vec<i64> = (1..=MAX_BULK_TASK_IDS as i64 + 1).collect();
+        let err = validate_task_ids(&over_cap).unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("task_ids"));
+        assert!(err.message.contains(&MAX_BULK_TASK_IDS.to_string()));
     }
 }

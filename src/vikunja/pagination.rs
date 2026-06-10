@@ -6,7 +6,10 @@
 
 use reqwest::header::HeaderMap;
 use schemars::JsonSchema;
+use schemars::transform::RecursiveTransform;
 use serde::{Deserialize, Serialize};
+
+use crate::schema::strip_unsigned_formats;
 
 pub const TOTAL_PAGES_HEADER: &str = "x-pagination-total-pages";
 pub const RESULT_COUNT_HEADER: &str = "x-pagination-result-count";
@@ -40,6 +43,7 @@ impl PageParams {
 
 /// Pagination metadata returned alongside a page of results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct PageInfo {
     /// The 1-based page number that was fetched.
     pub page: u32,

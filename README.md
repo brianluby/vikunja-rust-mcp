@@ -129,6 +129,14 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_tasks_reopen` | Mark a task not done. |
 | `vikunja_tasks_assign` | Assign a user to a task. |
 | `vikunja_tasks_unassign` | Remove a user from a task. |
+| `vikunja_tasks_bulk_complete` | Mark several tasks done (explicit ids, per-task results). |
+| `vikunja_tasks_bulk_reopen` | Mark several tasks not done (explicit ids, per-task results). |
+| `vikunja_tasks_bulk_update` | Apply one partial update to several tasks (explicit ids, per-task results). |
+| `vikunja_tasks_bulk_move` | Move several tasks to another project (explicit ids, per-task results). |
+| `vikunja_tasks_bulk_assign` | Assign one user to several tasks (explicit ids, per-task results). |
+| `vikunja_tasks_bulk_unassign` | Remove one user from several tasks (explicit ids, per-task results). |
+| `vikunja_task_labels_bulk_add` | Add one label to several tasks (explicit ids, per-task results). |
+| `vikunja_task_labels_bulk_remove` | Remove one label from several tasks (explicit ids, per-task results). |
 | `vikunja_labels_list` | List/search labels (paginated). |
 | `vikunja_labels_create` | Create a label. |
 | `vikunja_labels_update` | Partially update a label. |
@@ -159,6 +167,28 @@ payload. To make partial updates safe, this server first `GET`s the current
 entity, overlays only the fields you provided, and writes the merged object
 back. Fields you don't pass keep their values. To clear a date field, pass
 the zero value `0001-01-01T00:00:00Z` explicitly.
+
+### Bulk semantics (explicit ids, partial failure)
+
+The `*_bulk_*` tools are deliberately conservative:
+
+- They require an **explicit list of task ids** — there is no filter-based
+  bulk write, so a tool call can never touch more tasks than it names.
+- Batches are capped at **100 task ids per call**; larger lists are rejected
+  up front so one MCP call cannot flood the Vikunja instance. Split bigger
+  jobs into multiple calls.
+- All arguments are validated up front (`task_ids` non-empty, positive and
+  within the cap, `label_id`/`user_id`/`project_id` positive); nothing is
+  written if validation fails.
+- Each task is processed through the same safe per-task calls as the
+  single-task tools (including read-merge-write for updates and moves), and
+  writes are **never retried automatically**.
+- Results are **per task**: after validation passes, one failing task does
+  not fail the call. The result reports `ok` (true only when nothing
+  failed), `total`/`succeeded`/`failed` counts, and a `results` entry per
+  task with the updated task or a confirmation message on success, or a
+  structured error (`kind`, HTTP status, Vikunja error code, message) on
+  failure.
 
 ## Resources
 
@@ -242,6 +272,10 @@ entities (cleanup is best-effort).
 - Attachment uploads are capped at 20 MiB and rejected before the file is
   read into memory; inline downloads are capped at 2 MiB and aborted without
   buffering; `save_path` downloads stream to disk.
+- Bulk tools only operate on explicitly listed task ids (at most 100 per
+  call) — filter-based bulk writes are not supported — and report partial
+  failures per task instead of retrying or aborting the batch (see *Bulk
+  semantics* above).
 
 ## Vikunja API capabilities intentionally omitted
 
@@ -249,9 +283,14 @@ entities (cleanup is best-effort).
   targets the current stable API (`GET /tasks`).
 - **Kanban views/buckets, saved filters, task relations, reminders as
   first-class tools, reactions, link/user shares, webhooks, notifications,
-  migrations, bulk endpoints** (`/tasks/bulk`, label/assignee bulk): out of
-  scope for the core resource set this server exposes. Reminders/relations
-  still appear in task JSON where Vikunja returns them.
+  migrations**: out of scope for the core resource set this server exposes.
+  Reminders/relations still appear in task JSON where Vikunja returns them.
+- **Vikunja's native bulk endpoints** (`/tasks/bulk`, label/assignee bulk):
+  not used. Bulk task operations *are* available as the `*_bulk_*` tools
+  above, but they fan out over the same per-task endpoints as the
+  single-task tools and require explicit task ids — Vikunja's filter-based
+  bulk endpoints are intentionally avoided so a single call cannot perform
+  unbounded writes.
 - **Team create/update/delete and membership management:** only team
   listing (global and per-project) is exposed, per the intended tool surface.
 - **Listing task assignees as a separate tool:** assignees are already

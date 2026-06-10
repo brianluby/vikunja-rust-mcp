@@ -66,6 +66,14 @@ const EXPECTED_TOOLS: &[&str] = &[
     "vikunja_tasks_reopen",
     "vikunja_tasks_assign",
     "vikunja_tasks_unassign",
+    "vikunja_tasks_bulk_complete",
+    "vikunja_tasks_bulk_reopen",
+    "vikunja_tasks_bulk_update",
+    "vikunja_tasks_bulk_move",
+    "vikunja_tasks_bulk_assign",
+    "vikunja_tasks_bulk_unassign",
+    "vikunja_task_labels_bulk_add",
+    "vikunja_task_labels_bulk_remove",
     "vikunja_labels_list",
     "vikunja_labels_create",
     "vikunja_labels_update",
@@ -136,7 +144,92 @@ async fn all_tools_are_registered_with_schemas() {
             .and_then(|a| a.destructive_hint),
         Some(true)
     );
+    for name in [
+        "vikunja_tasks_bulk_complete",
+        "vikunja_tasks_bulk_reopen",
+        "vikunja_tasks_bulk_update",
+        "vikunja_tasks_bulk_move",
+    ] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(
+            tool.annotations.as_ref().and_then(|a| a.idempotent_hint),
+            Some(true),
+            "{name} should be marked idempotent"
+        );
+    }
+    for name in [
+        "vikunja_task_labels_bulk_remove",
+        "vikunja_tasks_bulk_unassign",
+    ] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(
+            tool.annotations.as_ref().and_then(|a| a.destructive_hint),
+            Some(true),
+            "{name} should be marked destructive"
+        );
+    }
+    for name in ["vikunja_task_labels_bulk_add", "vikunja_tasks_bulk_assign"] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        assert_ne!(
+            tool.annotations.as_ref().and_then(|a| a.destructive_hint),
+            Some(true),
+            "{name} should not be marked destructive"
+        );
+        assert_ne!(
+            tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(true),
+            "{name} should not be marked read-only"
+        );
+    }
 
+    client.cancel().await.unwrap();
+}
+
+/// Strict MCP clients log "unknown format ignored" warnings for schemas
+/// using schemars' Rust-specific unsigned formats (`uint`, `uint32`, ...).
+/// Every published input and output schema must be free of them.
+#[tokio::test]
+async fn schemas_contain_no_nonstandard_unsigned_formats() {
+    fn collect_formats(value: &serde_json::Value, found: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::String(format)) = map.get("format") {
+                    found.push(format.clone());
+                }
+                for nested in map.values() {
+                    collect_formats(nested, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for nested in items {
+                    collect_formats(nested, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let client = connect("http://127.0.0.1:1").await;
+    let tools = client.list_all_tools().await.unwrap();
+    assert!(!tools.is_empty());
+
+    for tool in &tools {
+        let mut formats = Vec::new();
+        collect_formats(
+            &serde_json::to_value(&tool.input_schema).unwrap(),
+            &mut formats,
+        );
+        if let Some(output) = &tool.output_schema {
+            collect_formats(&serde_json::to_value(output).unwrap(), &mut formats);
+        }
+        for format in formats {
+            assert!(
+                !format.starts_with("uint"),
+                "tool {} publishes schemars-specific format {format:?}",
+                tool.name
+            );
+        }
+    }
     client.cancel().await.unwrap();
 }
 
@@ -387,6 +480,463 @@ async fn assign_and_unassign_users() {
     .unwrap();
     assert_eq!(structured(&unassigned)["message"], "unassigned");
 
+    client.cancel().await.unwrap();
+}
+
+// ----- bulk task operations ---------------------------------------------------
+
+#[tokio::test]
+async fn bulk_complete_succeeds_for_all_tasks() {
+    let server = MockServer::start().await;
+    for id in [11, 12] {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/tasks/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": id, "title": "Task", "done": false, "project_id": 3
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/tasks/{id}")))
+            .and(body_json(json!({
+                "id": id, "title": "Task", "done": true, "project_id": 3
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": id, "title": "Task", "done": true, "project_id": 3,
+                "done_at": "2026-06-10T10:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_tasks_bulk_complete",
+        json!({"task_ids": [11, 12]}),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["total"], 2);
+    assert_eq!(body["succeeded"], 2);
+    assert_eq!(body["failed"], 0);
+    for (index, id) in [(0, 11), (1, 12)] {
+        assert_eq!(body["results"][index]["task_id"], id);
+        assert_eq!(body["results"][index]["ok"], true);
+        assert_eq!(body["results"][index]["operation"], "complete");
+        assert_eq!(body["results"][index]["task"]["done"], true);
+        assert!(body["results"][index]["error"].is_null());
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_reopen_marks_tasks_not_done() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/13"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 13, "title": "Task", "done": true, "project_id": 3
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/13"))
+        .and(body_json(json!({
+            "id": 13, "title": "Task", "done": false, "project_id": 3
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 13, "title": "Task", "done": false, "project_id": 3
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_tasks_bulk_reopen",
+        json!({"task_ids": [13]}),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["results"][0]["operation"], "reopen");
+    assert_eq!(body["results"][0]["task"]["done"], false);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_update_reports_partial_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/21"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 21, "title": "First", "done": false, "project_id": 3
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/21"))
+        .and(body_json(json!({
+            "id": 21, "title": "First", "done": false, "project_id": 3, "priority": 4
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 21, "title": "First", "done": false, "project_id": 3, "priority": 4
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The second task does not exist: its read fails, no write is issued.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/22"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "code": 4002, "message": "The task does not exist."
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_tasks_bulk_update",
+        json!({"task_ids": [21, 22], "priority": 4}),
+    )
+    .await
+    .expect("partial failure must not fail the tool call");
+
+    let body = structured(&result);
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["total"], 2);
+    assert_eq!(body["succeeded"], 1);
+    assert_eq!(body["failed"], 1);
+
+    assert_eq!(body["results"][0]["ok"], true);
+    assert_eq!(body["results"][0]["operation"], "update");
+    assert_eq!(body["results"][0]["task"]["priority"], 4);
+
+    let failure = &body["results"][1];
+    assert_eq!(failure["task_id"], 22);
+    assert_eq!(failure["ok"], false);
+    assert!(failure["task"].is_null());
+    assert_eq!(failure["error"]["kind"], "not_found");
+    assert_eq!(failure["error"]["http_status"], 404);
+    assert_eq!(failure["error"]["vikunja_error_code"], 4002);
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not exist")
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_validation_rejects_bad_arguments_before_any_request() {
+    // Unreachable Vikunja: any request would fail differently, so an
+    // invalid-params error proves validation fired first.
+    let client = connect("http://127.0.0.1:1").await;
+
+    // Empty task_ids on every bulk tool.
+    for (tool, extra) in [
+        ("vikunja_tasks_bulk_complete", json!({})),
+        ("vikunja_tasks_bulk_reopen", json!({})),
+        ("vikunja_tasks_bulk_update", json!({"priority": 1})),
+        ("vikunja_tasks_bulk_move", json!({"project_id": 1})),
+        ("vikunja_task_labels_bulk_add", json!({"label_id": 1})),
+        ("vikunja_task_labels_bulk_remove", json!({"label_id": 1})),
+        ("vikunja_tasks_bulk_assign", json!({"user_id": 1})),
+        ("vikunja_tasks_bulk_unassign", json!({"user_id": 1})),
+    ] {
+        let mut args = extra;
+        args["task_ids"] = json!([]);
+        let err = call(&client, tool, args).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error for {tool}");
+        };
+        assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{tool}");
+        assert!(
+            data.message.contains("task_ids"),
+            "{tool}: {}",
+            data.message
+        );
+    }
+
+    // Oversized batch: more ids than the documented per-call cap.
+    let too_many: Vec<i64> = (1..=101).collect();
+    let err = call(
+        &client,
+        "vikunja_tasks_bulk_complete",
+        json!({"task_ids": too_many}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(data.message.contains("at most 100"), "{}", data.message);
+
+    // Non-positive task ids.
+    for ids in [json!([0]), json!([-1]), json!([3, -7])] {
+        let err = call(
+            &client,
+            "vikunja_tasks_bulk_complete",
+            json!({"task_ids": ids}),
+        )
+        .await
+        .unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error");
+        };
+        assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(data.message.contains("positive"));
+    }
+
+    // Non-positive companion ids.
+    for (tool, args, field) in [
+        (
+            "vikunja_task_labels_bulk_add",
+            json!({"task_ids": [1], "label_id": 0}),
+            "label_id",
+        ),
+        (
+            "vikunja_task_labels_bulk_remove",
+            json!({"task_ids": [1], "label_id": -2}),
+            "label_id",
+        ),
+        (
+            "vikunja_tasks_bulk_assign",
+            json!({"task_ids": [1], "user_id": -3}),
+            "user_id",
+        ),
+        (
+            "vikunja_tasks_bulk_unassign",
+            json!({"task_ids": [1], "user_id": 0}),
+            "user_id",
+        ),
+        (
+            "vikunja_tasks_bulk_move",
+            json!({"task_ids": [1], "project_id": 0}),
+            "project_id",
+        ),
+        (
+            "vikunja_tasks_bulk_update",
+            json!({"task_ids": [1], "project_id": -1}),
+            "project_id",
+        ),
+    ] {
+        let err = call(&client, tool, args).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error for {tool}");
+        };
+        assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{tool}");
+        assert!(data.message.contains(field), "{tool}: {}", data.message);
+    }
+
+    // Empty bulk update patch.
+    let err = call(
+        &client,
+        "vikunja_tasks_bulk_update",
+        json!({"task_ids": [1, 2]}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("nothing to update"));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_label_add_and_remove_return_per_task_messages() {
+    let server = MockServer::start().await;
+    for id in [1, 2] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/v1/tasks/{id}/labels")))
+            .and(body_json(json!({"label_id": 7})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"label_id": 7})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/v1/tasks/{id}/labels/7")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"message": "removed"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = connect(&server.uri()).await;
+
+    let added = call(
+        &client,
+        "vikunja_task_labels_bulk_add",
+        json!({"task_ids": [1, 2], "label_id": 7}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&added);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["succeeded"], 2);
+    assert_eq!(body["results"][0]["operation"], "label_add");
+    assert_eq!(body["results"][0]["message"], "label 7 added to task 1");
+    assert_eq!(body["results"][1]["message"], "label 7 added to task 2");
+    assert!(body["results"][0]["task"].is_null());
+
+    let removed = call(
+        &client,
+        "vikunja_task_labels_bulk_remove",
+        json!({"task_ids": [1, 2], "label_id": 7}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&removed);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["results"][0]["operation"], "label_remove");
+    assert_eq!(body["results"][0]["message"], "removed");
+    assert_eq!(body["results"][1]["message"], "removed");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_assign_and_unassign_users() {
+    let server = MockServer::start().await;
+    for id in [4, 5] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/v1/tasks/{id}/assignees")))
+            .and(body_json(json!({"user_id": 3})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"user_id": 3})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/v1/tasks/{id}/assignees/3")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"message": "unassigned"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = connect(&server.uri()).await;
+
+    let assigned = call(
+        &client,
+        "vikunja_tasks_bulk_assign",
+        json!({"task_ids": [4, 5], "user_id": 3}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&assigned);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["results"][0]["operation"], "assign");
+    assert_eq!(body["results"][0]["message"], "user 3 assigned to task 4");
+    assert_eq!(body["results"][1]["message"], "user 3 assigned to task 5");
+
+    let unassigned = call(
+        &client,
+        "vikunja_tasks_bulk_unassign",
+        json!({"task_ids": [4, 5], "user_id": 3}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&unassigned);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["results"][0]["operation"], "unassign");
+    assert_eq!(body["results"][0]["message"], "unassigned");
+    assert_eq!(body["results"][1]["message"], "unassigned");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_move_preserves_fields_via_read_merge_write() {
+    let server = MockServer::start().await;
+    // The exact POST body proves read-merge-write: every field from the GET
+    // is preserved and only project_id changes.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/31"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 31, "title": "Keep me", "done": false, "project_id": 3, "priority": 2
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/31"))
+        .and(body_json(json!({
+            "id": 31, "title": "Keep me", "done": false, "project_id": 9, "priority": 2
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 31, "title": "Keep me", "done": false, "project_id": 9, "priority": 2
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_tasks_bulk_move",
+        json!({"task_ids": [31], "project_id": 9}),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["results"][0]["operation"], "move");
+    assert_eq!(body["results"][0]["task"]["project_id"], 9);
+    assert_eq!(body["results"][0]["task"]["title"], "Keep me");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_writes_are_not_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/41"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 41, "title": "Task", "done": false, "project_id": 3
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // expect(1) verifies on drop that the failing write was attempted
+    // exactly once — no automatic retry.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/41"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"message": "boom"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_tasks_bulk_complete",
+        json!({"task_ids": [41]}),
+    )
+    .await
+    .expect("item failure must not fail the tool call");
+
+    let body = structured(&result);
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["failed"], 1);
+    assert_eq!(body["results"][0]["error"]["kind"], "server");
+    assert_eq!(body["results"][0]["error"]["http_status"], 500);
     client.cancel().await.unwrap();
 }
 
