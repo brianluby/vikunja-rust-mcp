@@ -16,8 +16,8 @@ use crate::error::{ApiErrorKind, Error};
 use crate::schema::strip_unsigned_formats;
 use crate::vikunja::client::TaskListOptions;
 use crate::vikunja::models::{
-    Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, Task, TaskAttachment,
-    TaskComment, TaskCreate, TaskUpdate, Team, User,
+    Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, RelationKind, Task,
+    TaskAttachment, TaskComment, TaskCreate, TaskRelation, TaskUpdate, Team, User,
 };
 use crate::vikunja::pagination::{PageInfo, PageParams};
 
@@ -318,6 +318,18 @@ pub struct TaskLabelArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskRelationArgs {
+    /// Numeric id of the task the relation starts from.
+    pub task_id: i64,
+    /// Numeric id of the task the relation points to. Must differ from
+    /// `task_id`.
+    pub other_task_id: i64,
+    /// Kind of the relation as seen from `task_id`, e.g. `blocking` means
+    /// `task_id` blocks `other_task_id`.
+    pub relation_kind: RelationKind,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct CommentsCreateArgs {
     /// Numeric id of the task to comment on.
     pub task_id: i64,
@@ -479,6 +491,26 @@ pub struct CommentListResult {
     pub comments: Vec<TaskComment>,
 }
 
+/// Tasks related to one task under a single relation kind.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TaskRelationGroup {
+    /// Relation kind as seen from the queried task, e.g. `blocking`.
+    pub relation_kind: String,
+    /// The related tasks.
+    pub tasks: Vec<Task>,
+}
+
+/// All relations of one task. `relation_kind` is a plain string here (not
+/// the [`RelationKind`] enum) so kinds added by a newer Vikunja server pass
+/// through instead of failing deserialization.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RelationListResult {
+    /// The task whose relations were listed.
+    pub task_id: i64,
+    /// Related tasks grouped by relation kind, sorted by kind.
+    pub relations: Vec<TaskRelationGroup>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AttachmentListResult {
     pub attachments: Vec<TaskAttachment>,
@@ -530,8 +562,8 @@ pub struct BulkTaskResult {
 #[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct BulkItemError {
     /// Error category: `auth`, `forbidden`, `not_found`, `validation`,
-    /// `rate_limited`, `server`, `network`, `timeout`, `invalid_response`,
-    /// `io`, `too_large`, `invalid_argument` or `other`.
+    /// `conflict`, `rate_limited`, `server`, `network`, `timeout`,
+    /// `invalid_response`, `io`, `too_large`, `invalid_argument` or `other`.
     pub kind: String,
     /// HTTP status reported by Vikunja, when the API answered.
     pub http_status: Option<u16>,
@@ -552,6 +584,7 @@ impl BulkItemError {
                     ApiErrorKind::Forbidden => "forbidden",
                     ApiErrorKind::NotFound => "not_found",
                     ApiErrorKind::Validation => "validation",
+                    ApiErrorKind::Conflict => "conflict",
                     ApiErrorKind::RateLimited => "rate_limited",
                     ApiErrorKind::Server => "server",
                     ApiErrorKind::Other => "other",
@@ -613,6 +646,19 @@ fn page_params(page: Option<u32>, per_page: Option<u32>) -> Result<PageParams, M
         return Err(Error::InvalidArgument("per_page must be >= 1".to_string()).to_mcp());
     }
     Ok(PageParams::new(page, per_page))
+}
+
+/// Validates the two task ids of a relation: both positive and distinct.
+fn relation_pair(task_id: i64, other_task_id: i64) -> Result<(i64, i64), McpError> {
+    let task_id = positive("task_id", task_id)?;
+    let other_task_id = positive("other_task_id", other_task_id)?;
+    if task_id == other_task_id {
+        return Err(Error::InvalidArgument(
+            "task_id and other_task_id must be different tasks".to_string(),
+        )
+        .to_mcp());
+    }
+    Ok((task_id, other_task_id))
 }
 
 fn non_empty(name: &str, value: &str) -> Result<(), McpError> {
@@ -1488,6 +1534,67 @@ impl VikunjaMcpServer {
         let task_id = positive("task_id", args.task_id)?;
         let label_id = positive("label_id", args.label_id)?;
         let message = self.client().remove_task_label(task_id, label_id).await?;
+        Ok(Json(OperationResult {
+            ok: true,
+            message: message.message,
+        }))
+    }
+
+    // -- Task relations --
+
+    #[tool(
+        name = "vikunja_task_relations_list",
+        description = "List a Vikunja task's relations (subtasks, parent, blocking, ... ) grouped by relation kind.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn task_relations_list(
+        &self,
+        Parameters(args): Parameters<TaskIdArgs>,
+    ) -> Result<Json<RelationListResult>, McpError> {
+        let task_id = positive("task_id", args.task_id)?;
+        let task = self.client().get_task(task_id).await?;
+        let relations = task
+            .related_tasks
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(relation_kind, tasks)| TaskRelationGroup {
+                relation_kind,
+                tasks,
+            })
+            .collect();
+        Ok(Json(RelationListResult { task_id, relations }))
+    }
+
+    #[tool(
+        name = "vikunja_task_relations_create",
+        description = "Create a relation between two Vikunja tasks, e.g. relation_kind 'blocking' means task_id blocks other_task_id. Kinds: subtask, parenttask, related, duplicateof, duplicates, blocking, blocked, precedes, follows, copiedfrom, copiedto."
+    )]
+    pub async fn task_relations_create(
+        &self,
+        Parameters(args): Parameters<TaskRelationArgs>,
+    ) -> Result<Json<TaskRelation>, McpError> {
+        let (task_id, other_task_id) = relation_pair(args.task_id, args.other_task_id)?;
+        Ok(Json(
+            self.client()
+                .create_task_relation(task_id, other_task_id, args.relation_kind)
+                .await?,
+        ))
+    }
+
+    #[tool(
+        name = "vikunja_task_relations_delete",
+        description = "Delete a relation between two Vikunja tasks. The relation_kind must match the existing relation as seen from task_id.",
+        annotations(destructive_hint = true)
+    )]
+    pub async fn task_relations_delete(
+        &self,
+        Parameters(args): Parameters<TaskRelationArgs>,
+    ) -> Result<Json<OperationResult>, McpError> {
+        let (task_id, other_task_id) = relation_pair(args.task_id, args.other_task_id)?;
+        let message = self
+            .client()
+            .delete_task_relation(task_id, other_task_id, args.relation_kind)
+            .await?;
         Ok(Json(OperationResult {
             ok: true,
             message: message.message,

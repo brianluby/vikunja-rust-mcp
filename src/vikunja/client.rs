@@ -22,7 +22,8 @@ use crate::error::Error;
 
 use super::models::{
     Label, LabelCreate, LabelTask, LabelUpdate, Message, Project, ProjectCreate, ProjectUpdate,
-    Task, TaskAssignee, TaskComment, TaskCreate, TaskUpdate, Team, User,
+    RelationKind, Task, TaskAssignee, TaskComment, TaskCreate, TaskRelation, TaskUpdate, Team,
+    User,
 };
 use super::pagination::{Page, PageInfo, PageParams};
 
@@ -544,6 +545,47 @@ impl VikunjaClient {
             "task_labels.remove",
             Method::DELETE,
             &format!("/tasks/{task_id}/labels/{label_id}"),
+        )
+        .await
+    }
+
+    // ----- Task relations ---------------------------------------------------
+
+    /// `PUT /tasks/{taskID}/relations` — create a relation between two tasks.
+    pub async fn create_task_relation(
+        &self,
+        task_id: i64,
+        other_task_id: i64,
+        kind: RelationKind,
+    ) -> Result<TaskRelation, Error> {
+        self.send_json(
+            "task_relations.create",
+            Method::PUT,
+            &format!("/tasks/{task_id}/relations"),
+            &serde_json::json!({
+                "task_id": task_id,
+                "other_task_id": other_task_id,
+                "relation_kind": kind,
+            }),
+        )
+        .await
+    }
+
+    /// `DELETE /tasks/{taskID}/relations/{relationKind}/{otherTaskID}` —
+    /// remove a relation between two tasks.
+    pub async fn delete_task_relation(
+        &self,
+        task_id: i64,
+        other_task_id: i64,
+        kind: RelationKind,
+    ) -> Result<Message, Error> {
+        self.send_empty(
+            "task_relations.delete",
+            Method::DELETE,
+            &format!(
+                "/tasks/{task_id}/relations/{}/{other_task_id}",
+                kind.as_str()
+            ),
         )
         .await
     }

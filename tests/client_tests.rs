@@ -10,7 +10,7 @@ use serde_json::json;
 use vikunja_rust_mcp::error::{ApiErrorKind, Error};
 use vikunja_rust_mcp::vikunja::client::TaskListOptions;
 use vikunja_rust_mcp::vikunja::models::{
-    LabelCreate, LabelUpdate, ProjectCreate, ProjectUpdate, TaskCreate, TaskUpdate,
+    LabelCreate, LabelUpdate, ProjectCreate, ProjectUpdate, RelationKind, TaskCreate, TaskUpdate,
 };
 use vikunja_rust_mcp::vikunja::pagination::PageParams;
 use wiremock::matchers::{body_json, body_string_contains, header, method, path, query_param};
@@ -1147,4 +1147,127 @@ async fn probe_reports_success_status() {
 
     let client = test_client(&server.uri());
     assert_eq!(client.probe().await.unwrap().as_u16(), 200);
+}
+
+// ----- task relations ---------------------------------------------------------
+
+#[tokio::test]
+async fn create_task_relation_puts_kind_and_ids() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/tasks/5/relations"))
+        .and(body_json(json!({
+            "task_id": 5, "other_task_id": 9, "relation_kind": "blocking"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "task_id": 5, "other_task_id": 9, "relation_kind": "blocking",
+            "created_by": {"id": 1, "username": "ada"},
+            "created": "2026-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let relation = client
+        .create_task_relation(5, 9, RelationKind::Blocking)
+        .await
+        .unwrap();
+    assert_eq!(relation.task_id, 5);
+    assert_eq!(relation.other_task_id, 9);
+    assert_eq!(relation.relation_kind, RelationKind::Blocking);
+    assert_eq!(relation.created_by.unwrap().username, "ada");
+}
+
+#[tokio::test]
+async fn delete_task_relation_encodes_kind_in_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/tasks/5/relations/subtask/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": "The task relation was successfully deleted."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let message = client
+        .delete_task_relation(5, 9, RelationKind::Subtask)
+        .await
+        .unwrap();
+    assert!(message.message.contains("deleted"));
+}
+
+#[tokio::test]
+async fn create_task_relation_maps_already_exists_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/tasks/5/relations"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "code": 4012, "message": "The task relation already exists."
+        })))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let err = client
+        .create_task_relation(5, 9, RelationKind::Related)
+        .await
+        .unwrap_err();
+    let Error::Api {
+        status,
+        code,
+        message,
+        ..
+    } = err
+    else {
+        panic!("expected API error, got {err:?}");
+    };
+    assert_eq!(status, 409);
+    assert_eq!(code, Some(4012));
+    assert!(message.contains("already exists"));
+}
+
+#[tokio::test]
+async fn create_task_relation_maps_invalid_task_to_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/tasks/999/relations"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "code": 4002, "message": "The task does not exist."
+        })))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let err = client
+        .create_task_relation(999, 9, RelationKind::Related)
+        .await
+        .unwrap_err();
+    let Error::Api { kind, .. } = err else {
+        panic!("expected API error, got {err:?}");
+    };
+    assert_eq!(kind, ApiErrorKind::NotFound);
+}
+
+#[tokio::test]
+async fn get_task_decodes_related_tasks() {
+    let server = MockServer::start().await;
+    let mut body = task_json(7, "parent", false);
+    body["related_tasks"] = json!({
+        "subtask": [task_json(11, "child a", false), task_json(12, "child b", true)],
+        "blocking": [task_json(9, "blocker", false)]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let task = client.get_task(7).await.unwrap();
+    let related = task.related_tasks.expect("related_tasks should be parsed");
+    assert_eq!(related["subtask"].len(), 2);
+    assert_eq!(related["blocking"][0].id, 9);
 }

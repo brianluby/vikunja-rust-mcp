@@ -80,6 +80,9 @@ const EXPECTED_TOOLS: &[&str] = &[
     "vikunja_labels_delete",
     "vikunja_task_labels_add",
     "vikunja_task_labels_remove",
+    "vikunja_task_relations_list",
+    "vikunja_task_relations_create",
+    "vikunja_task_relations_delete",
     "vikunja_task_comments_list",
     "vikunja_task_comments_create",
     "vikunja_task_comments_update",
@@ -2386,5 +2389,265 @@ async fn malformed_template_ids_are_not_found() {
             "{uri}"
         );
     }
+    client.cancel().await.unwrap();
+}
+
+// ----- task relations ---------------------------------------------------------
+
+#[tokio::test]
+async fn task_relations_create_and_delete_round_trip() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/tasks/5/relations"))
+        .and(body_json(json!({
+            "task_id": 5, "other_task_id": 9, "relation_kind": "blocking"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "task_id": 5, "other_task_id": 9, "relation_kind": "blocking",
+            "created": "2026-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/tasks/5/relations/blocking/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": "The task relation was successfully deleted."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let created = call(
+        &client,
+        "vikunja_task_relations_create",
+        json!({"task_id": 5, "other_task_id": 9, "relation_kind": "blocking"}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&created);
+    assert_eq!(body["task_id"], 5);
+    assert_eq!(body["other_task_id"], 9);
+    assert_eq!(body["relation_kind"], "blocking");
+
+    let deleted = call(
+        &client,
+        "vikunja_task_relations_delete",
+        json!({"task_id": 5, "other_task_id": 9, "relation_kind": "blocking"}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&deleted);
+    assert_eq!(body["ok"], true);
+    assert!(body["message"].as_str().unwrap().contains("deleted"));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_list_groups_relations_by_kind() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 7, "title": "parent", "project_id": 3,
+            "related_tasks": {
+                "subtask": [
+                    {"id": 11, "title": "child a", "project_id": 3},
+                    {"id": 12, "title": "child b", "project_id": 3, "done": true}
+                ],
+                "blocking": [
+                    {"id": 9, "title": "blocker", "project_id": 3}
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_relations_list",
+        json!({"task_id": 7}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["task_id"], 7);
+    let relations = body["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 2);
+    // BTreeMap ordering: "blocking" sorts before "subtask".
+    assert_eq!(relations[0]["relation_kind"], "blocking");
+    assert_eq!(relations[0]["tasks"][0]["id"], 9);
+    assert_eq!(relations[1]["relation_kind"], "subtask");
+    assert_eq!(relations[1]["tasks"].as_array().unwrap().len(), 2);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_list_returns_empty_for_task_without_relations() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/8"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 8, "title": "lonely", "project_id": 3
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_relations_list",
+        json!({"task_id": 8}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["task_id"], 8);
+    assert_eq!(body["relations"].as_array().unwrap().len(), 0);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_reject_self_relation() {
+    // Unreachable Vikunja: validation must fire before any request.
+    let client = connect("http://127.0.0.1:1").await;
+    for tool in [
+        "vikunja_task_relations_create",
+        "vikunja_task_relations_delete",
+    ] {
+        let err = call(
+            &client,
+            tool,
+            json!({"task_id": 5, "other_task_id": 5, "relation_kind": "related"}),
+        )
+        .await
+        .unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error from {tool}, got {err:?}");
+        };
+        assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(data.message.contains("other_task_id"));
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_reject_invalid_kind() {
+    let client = connect("http://127.0.0.1:1").await;
+    for kind in ["unknown", "blocks", ""] {
+        let err = call(
+            &client,
+            "vikunja_task_relations_create",
+            json!({"task_id": 5, "other_task_id": 9, "relation_kind": kind}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ServiceError::McpError(_)),
+            "kind {kind:?} should be rejected, got {err:?}"
+        );
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_reject_nonpositive_ids() {
+    let client = connect("http://127.0.0.1:1").await;
+    for (tool, args) in [
+        (
+            "vikunja_task_relations_create",
+            json!({"task_id": 0, "other_task_id": 9, "relation_kind": "related"}),
+        ),
+        (
+            "vikunja_task_relations_create",
+            json!({"task_id": 5, "other_task_id": -2, "relation_kind": "related"}),
+        ),
+        (
+            "vikunja_task_relations_delete",
+            json!({"task_id": -1, "other_task_id": 9, "relation_kind": "related"}),
+        ),
+        (
+            "vikunja_task_relations_delete",
+            json!({"task_id": 5, "other_task_id": 0, "relation_kind": "related"}),
+        ),
+        ("vikunja_task_relations_list", json!({"task_id": 0})),
+    ] {
+        let err = call(&client, tool, args).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error from {tool}");
+        };
+        assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(data.message.contains("task_id"));
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_tool_annotations() {
+    let client = connect("http://127.0.0.1:1").await;
+    let tools = client.list_all_tools().await.unwrap();
+
+    let list_tool = tools
+        .iter()
+        .find(|t| t.name == "vikunja_task_relations_list")
+        .unwrap();
+    assert_eq!(
+        list_tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint),
+        Some(true)
+    );
+    let delete_tool = tools
+        .iter()
+        .find(|t| t.name == "vikunja_task_relations_delete")
+        .unwrap();
+    assert_eq!(
+        delete_tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.destructive_hint),
+        Some(true)
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_create_surfaces_already_exists_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/tasks/5/relations"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "code": 4012, "message": "The task relation already exists."
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let err = call(
+        &client,
+        "vikunja_task_relations_create",
+        json!({"task_id": 5, "other_task_id": 9, "relation_kind": "blocking"}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error, got {err:?}");
+    };
+    // A conflict is user-correctable, not a server failure: it must surface
+    // as invalid_params, like the other request-level errors.
+    assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(data.message.contains("already exists"));
+    let details = data.data.expect("error data");
+    assert_eq!(details["http_status"], 409);
+    assert_eq!(details["kind"], "conflict");
+    assert_eq!(details["vikunja_error_code"], 4012);
+    assert_eq!(details["endpoint"], "task_relations.create");
     client.cancel().await.unwrap();
 }
