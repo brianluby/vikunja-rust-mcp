@@ -50,6 +50,8 @@ Configuration comes from CLI flags or environment variables (flags win):
 | `MCP_HTTP_ALLOW_UNAUTHENTICATED` | `--http-allow-unauthenticated` | no | `false` | Explicitly serve `/mcp` without authentication on non-loopback binds (only behind an authenticating reverse proxy). |
 | `VIKUNJA_TIMEOUT_SECS` | `--timeout-secs` | no | `30` | Per-request timeout against the Vikunja API. |
 | `VIKUNJA_DEFAULT_PAGE_SIZE` | `--default-page-size` | no | `50` | `per_page` used when a tool call does not specify one (1–250; the Vikunja server also caps it). |
+| `VIKUNJA_DATE_DEFAULT_TIME` | `--date-default-time` | no | `09:00` | Time of day (`HH:MM`) applied when a date shortcut resolves to a calendar day (see *Smart date shortcuts*). |
+| `VIKUNJA_DATE_END_OF_DAY_TIME` | `--date-end-of-day-time` | no | `23:59` | Time of day (`HH:MM`) used by the `end of week` date shortcut. |
 
 Configuration is validated at startup; a missing/invalid URL or token fails
 fast with an actionable message.
@@ -129,8 +131,8 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_projects_delete` | Delete a project and its tasks. |
 | `vikunja_tasks_list` | List/search tasks; optional `project_id`, Vikunja `filter` expression, `sort_by`/`order_by`. |
 | `vikunja_tasks_get` | Get one task with labels and assignees. |
-| `vikunja_tasks_create` | Create a task in a project. |
-| `vikunja_tasks_update` | Partially update a task (incl. moving projects). |
+| `vikunja_tasks_create` | Create a task in a project (RFC 3339 dates or `*_shortcut` date shortcuts). |
+| `vikunja_tasks_update` | Partially update a task (incl. moving projects; dates also via `*_shortcut`). |
 | `vikunja_tasks_delete` | Delete a task. |
 | `vikunja_tasks_complete` | Mark a task done. |
 | `vikunja_tasks_reopen` | Mark a task not done. |
@@ -163,6 +165,7 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_task_attachments_delete` | Delete an attachment. |
 | `vikunja_users_search` | Search users (for assignment). |
 | `vikunja_teams_list` | List teams; with `project_id`, list the teams that can access that project including their permission level. |
+| `vikunja_dates_resolve` | Preview how a date shortcut resolves to RFC 3339 (read-only, never calls Vikunja). |
 
 List tools return `{ items..., "pagination": { page, per_page, total_pages,
 result_count, has_more } }` built from Vikunja's `x-pagination-total-pages`
@@ -190,6 +193,45 @@ task 9 automatically). Supported kinds: `subtask`, `parenttask`, `related`,
 the kind is validated against this list before any request is sent; creating
 a relation that already exists or naming a missing task surfaces the Vikunja
 error (HTTP status and error code) unchanged.
+
+### Smart date shortcuts
+
+`vikunja_tasks_create`, `vikunja_tasks_update` and `vikunja_tasks_bulk_update`
+accept optional `due_date_shortcut`, `start_date_shortcut` and
+`end_date_shortcut` fields next to the RFC 3339 ones. RFC 3339 values keep
+working exactly as before (`"due_date": "2026-07-01T12:00:00Z"`); a shortcut
+is resolved to RFC 3339 on the server before anything is sent to Vikunja.
+Providing both a date field and its shortcut in one call is rejected.
+
+Supported expressions (case-insensitive; only this grammar, no free-form
+natural language):
+
+| Expression | Meaning |
+|---|---|
+| `today` / `tomorrow` / `yesterday` | That day at the default task time. |
+| `in N days` / `in N weeks` / `in N months` | N (positive integer) from today; months are calendar-aware (Jan 31 + 1 month clamps to end of February). |
+| `monday` … `sunday` | Next occurrence of that weekday — today counts only while the default time is still ahead. |
+| `next monday` … `next sunday` | That weekday strictly after today (always 1–7 days out). |
+| `end of week` | The upcoming Sunday at the end-of-day time. |
+| `YYYY-MM-DD` | That date at the default task time. |
+| `clear` / `none` / `unset` / `no due date` | Clear the date: updates send the zero date `0001-01-01T00:00:00Z`; creates simply omit the field. |
+
+Timezone and time behavior is explicit and deterministic:
+
+- Resolution uses the **server's local timezone** (the machine running this
+  MCP server). The resolved RFC 3339 value carries the local UTC offset.
+- Shortcuts resolve to the date at `VIKUNJA_DATE_DEFAULT_TIME` (default
+  `09:00`); `end of week` uses `VIKUNJA_DATE_END_OF_DAY_TIME` (default
+  `23:59`).
+- `vikunja_dates_resolve` previews a resolution without writing: pass
+  `expression` (plus optional `reference_time` to resolve against a fixed
+  RFC 3339 instant, whose offset then defines the timezone) and get back
+  `resolved`, `clears_date`, `timezone_description` and `default_time_used`.
+
+Examples: `{"due_date_shortcut": "next friday"}` resolves to the coming
+Friday at 09:00 server time; `{"due_date_shortcut": "clear"}` on update
+clears the due date; `{"due_date": "2026-07-01T12:00:00Z"}` still sets an
+exact timestamp.
 
 ### Bulk semantics (explicit ids, partial failure)
 
