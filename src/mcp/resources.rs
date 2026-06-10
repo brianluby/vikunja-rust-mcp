@@ -13,6 +13,8 @@ use serde_json::json;
 use crate::vikunja::VikunjaClient;
 use crate::vikunja::client::{TaskListOptions, saved_filter_options};
 
+use super::tools::load_project_buckets;
+
 pub const STATUS_URI: &str = "vikunja://status";
 pub const FILTERS_URI: &str = "vikunja://filters";
 pub const PROJECTS_URI: &str = "vikunja://projects";
@@ -24,6 +26,7 @@ pub const TASKS_HIGH_PRIORITY_URI: &str = "vikunja://tasks/high-priority";
 pub const TASKS_INBOX_URI: &str = "vikunja://tasks/inbox";
 pub const TASKS_RECENTLY_UPDATED_URI: &str = "vikunja://tasks/recently-updated";
 pub const PROJECT_URI_PREFIX: &str = "vikunja://projects/";
+const PROJECT_BUCKETS_SUFFIX: &str = "/buckets";
 pub const TASK_URI_PREFIX: &str = "vikunja://tasks/";
 pub const FILTER_URI_PREFIX: &str = "vikunja://filters/";
 const FILTER_TASKS_SUFFIX: &str = "/tasks";
@@ -203,6 +206,14 @@ pub fn templates() -> Vec<ResourceTemplate> {
             .with_description("One task by numeric id, including labels and assignees.")
             .with_mime_type("application/json")
             .no_annotation(),
+        RawResourceTemplate::new("vikunja://projects/{id}/buckets", "vikunja-project-buckets")
+            .with_title("Kanban buckets of a Vikunja project")
+            .with_description(
+                "The buckets (board lanes) of the project's first kanban view, \
+                 with each bucket's name and one page of its tasks.",
+            )
+            .with_mime_type("application/json")
+            .no_annotation(),
         RawResourceTemplate::new("vikunja://filters/{id}", "vikunja-filter")
             .with_title("A single saved Vikunja filter")
             .with_description(
@@ -232,6 +243,14 @@ pub async fn read(client: &VikunjaClient, uri: &str) -> Result<ReadResourceResul
         _ => {
             if let Some(view) = TaskView::from_uri(uri) {
                 return task_view(client, view).await;
+            }
+            // Must run before the plain projects/{id} template below: both
+            // share the "vikunja://projects/" prefix.
+            if let Some(id) = parse_project_buckets_id(uri) {
+                let result = load_project_buckets(client, id, None, Default::default())
+                    .await
+                    .map_err(|e| e.to_mcp())?;
+                return Ok(json_result(uri, &result));
             }
             if let Some(id) = parse_id(uri, PROJECT_URI_PREFIX) {
                 let project = client.get_project(id).await.map_err(|e| e.to_mcp())?;
@@ -371,6 +390,14 @@ fn parse_filter_tasks_id(uri: &str) -> Option<i64> {
     id.parse::<i64>().ok().filter(|id| *id > 0)
 }
 
+/// Extracts the project id from a `vikunja://projects/{id}/buckets` URI.
+fn parse_project_buckets_id(uri: &str) -> Option<i64> {
+    let id = uri
+        .strip_prefix(PROJECT_URI_PREFIX)?
+        .strip_suffix(PROJECT_BUCKETS_SUFFIX)?;
+    id.parse::<i64>().ok().filter(|id| *id > 0)
+}
+
 fn parse_id(uri: &str, prefix: &str) -> Option<i64> {
     uri.strip_prefix(prefix)
         .and_then(|raw| raw.parse::<i64>().ok())
@@ -504,12 +531,16 @@ mod tests {
     #[test]
     fn templates_are_advertised() {
         let templates = templates();
-        assert_eq!(templates.len(), 4);
+        assert_eq!(templates.len(), 5);
         assert_eq!(templates[0].raw.uri_template, "vikunja://projects/{id}");
         assert_eq!(templates[1].raw.uri_template, "vikunja://tasks/{id}");
-        assert_eq!(templates[2].raw.uri_template, "vikunja://filters/{id}");
         assert_eq!(
-            templates[3].raw.uri_template,
+            templates[2].raw.uri_template,
+            "vikunja://projects/{id}/buckets"
+        );
+        assert_eq!(templates[3].raw.uri_template, "vikunja://filters/{id}");
+        assert_eq!(
+            templates[4].raw.uri_template,
             "vikunja://filters/{id}/tasks"
         );
     }
