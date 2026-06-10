@@ -668,11 +668,14 @@ pub struct BucketInfo {
     pub count: i64,
     pub position: f64,
     /// True when new tasks land in this bucket by default. Only known when
-    /// the view definition was fetched (i.e. view_id was auto-resolved).
-    pub is_default_bucket: bool,
+    /// the view definition was fetched (i.e. view_id was auto-resolved);
+    /// omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_default_bucket: Option<bool>,
     /// True when tasks in this bucket are treated as done. Only known when
-    /// the view definition was fetched.
-    pub is_done_bucket: bool,
+    /// the view definition was fetched; omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_done_bucket: Option<bool>,
     /// Tasks currently in this bucket (one page per bucket); omitted when
     /// the bucket is empty and Vikunja sends no list.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1207,10 +1210,8 @@ pub(crate) async fn load_project_buckets(
         .map(|bucket: Bucket| BucketInfo {
             is_default_bucket: view
                 .as_ref()
-                .is_some_and(|view| view.default_bucket_id == bucket.id),
-            is_done_bucket: view
-                .as_ref()
-                .is_some_and(|view| view.done_bucket_id == bucket.id),
+                .map(|view| view.default_bucket_id == bucket.id),
+            is_done_bucket: view.as_ref().map(|view| view.done_bucket_id == bucket.id),
             id: bucket.id,
             title: bucket.title,
             limit: bucket.limit,

@@ -391,7 +391,7 @@ by name instead of by hidden numeric ids:
   projects with several kanban views. When the view definition was fetched
   (auto-resolution), each bucket also reports `is_default_bucket` /
   `is_done_bucket`; with an explicit `view_id` those flags are unknown and
-  reported as `false`.
+  omitted from the output.
 - Task JSON includes `bucket_id` whenever Vikunja reports it (a `0`/absent
   value is omitted), so bucket ids can be resolved to names via the bucket
   listing. Existing task outputs are unchanged otherwise.

@@ -3439,6 +3439,7 @@ async fn buckets_list_resolves_kanban_view_automatically() {
     assert_eq!(buckets.len(), 2);
     assert_eq!(buckets[0]["title"], "Backlog");
     assert_eq!(buckets[0]["is_default_bucket"], true);
+    assert_eq!(buckets[0]["is_done_bucket"], false);
     assert_eq!(buckets[1]["title"], "Doing");
     assert_eq!(buckets[1]["is_done_bucket"], true);
     assert_eq!(buckets[1]["tasks"][0]["title"], "Build the thing");
@@ -3467,10 +3468,11 @@ async fn buckets_list_uses_explicit_view_id_without_views_call() {
     .unwrap();
     let body = structured(&result);
     assert_eq!(body["view_id"], 4);
-    // Without the views listing the title is unknown (omitted) and the
-    // done/default flags are unknown -> false.
+    // Without the views listing the title and the done/default flags are
+    // unknown and omitted entirely (not reported as false).
     assert!(body.get("view_title").is_none());
-    assert_eq!(body["buckets"][1]["is_done_bucket"], false);
+    assert!(body["buckets"][1].get("is_done_bucket").is_none());
+    assert!(body["buckets"][1].get("is_default_bucket").is_none());
     client.cancel().await.unwrap();
 }
 
