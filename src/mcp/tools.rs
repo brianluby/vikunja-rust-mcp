@@ -17,7 +17,7 @@ use crate::vikunja::models::{
     Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, Task, TaskAttachment,
     TaskComment, TaskCreate, TaskUpdate, Team, User,
 };
-use crate::vikunja::pagination::{PageInfo, PageParams};
+use crate::vikunja::pagination::{BoundedPage, PageInfo, PageParams, walk_pages};
 
 use super::server::VikunjaMcpServer;
 
@@ -30,6 +30,12 @@ pub const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 /// fan-out (each id can cost several Vikunja requests) so a single MCP call
 /// cannot flood the instance or hold the connection open indefinitely.
 pub const MAX_BULK_TASK_IDS: usize = 100;
+/// Pages fetched by an auto-paginating list call when `max_pages` is not
+/// given. With the default page size of 50 this covers 500 items.
+pub const DEFAULT_AUTO_MAX_PAGES: u32 = 10;
+/// Hard upper bound on `max_pages`, so one tool call can never trigger an
+/// unbounded number of Vikunja requests.
+pub const MAX_AUTO_MAX_PAGES: u32 = 50;
 
 // ----- Shared argument/output shapes ----------------------------------------
 
@@ -44,6 +50,13 @@ pub struct ProjectsListArgs {
     pub per_page: Option<u32>,
     /// If true, return archived projects instead of active ones.
     pub is_archived: Option<bool>,
+    /// If true, fetch up to max_pages pages starting at page 1 and return
+    /// them as one result with auto_pagination metadata. Cannot be combined
+    /// with page.
+    pub auto_paginate: Option<bool>,
+    /// Page cap for auto_paginate: 1-50, default 10. Requires
+    /// auto_paginate: true.
+    pub max_pages: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -106,6 +119,13 @@ pub struct TasksListArgs {
     pub sort_by: Option<String>,
     /// Sort direction: `asc` or `desc`.
     pub order_by: Option<String>,
+    /// If true, fetch up to max_pages pages starting at page 1 and return
+    /// them as one result with auto_pagination metadata. Cannot be combined
+    /// with page.
+    pub auto_paginate: Option<bool>,
+    /// Page cap for auto_paginate: 1-50, default 10. Requires
+    /// auto_paginate: true.
+    pub max_pages: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -253,6 +273,13 @@ pub struct LabelsListArgs {
     pub page: Option<u32>,
     /// Items per page.
     pub per_page: Option<u32>,
+    /// If true, fetch up to max_pages pages starting at page 1 and return
+    /// them as one result with auto_pagination metadata. Cannot be combined
+    /// with page.
+    pub auto_paginate: Option<bool>,
+    /// Page cap for auto_paginate: 1-50, default 10. Requires
+    /// auto_paginate: true.
+    pub max_pages: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -326,6 +353,13 @@ pub struct AttachmentsListArgs {
     pub page: Option<u32>,
     /// Items per page.
     pub per_page: Option<u32>,
+    /// If true, fetch up to max_pages pages starting at page 1 and return
+    /// them as one result with auto_pagination metadata. Cannot be combined
+    /// with page.
+    pub auto_paginate: Option<bool>,
+    /// Page cap for auto_paginate: 1-50, default 10. Requires
+    /// auto_paginate: true.
+    pub max_pages: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -383,30 +417,73 @@ pub struct TeamsListArgs {
     /// If set, list the teams with access to this project (including their
     /// permission level) instead of all teams.
     pub project_id: Option<i64>,
+    /// If true, fetch up to max_pages pages starting at page 1 and return
+    /// them as one result with auto_pagination metadata. Cannot be combined
+    /// with page.
+    pub auto_paginate: Option<bool>,
+    /// Page cap for auto_paginate: 1-50, default 10. Requires
+    /// auto_paginate: true.
+    pub max_pages: Option<u32>,
+}
+
+/// Metadata describing a bounded auto-paginated fetch. Present in list
+/// results only when the call used `auto_paginate`.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct AutoPagination {
+    /// Number of pages actually fetched (at least 1).
+    pub pages_read: u32,
+    /// The page cap the fetch was bounded by.
+    pub page_cap: u32,
+    /// True when the page cap was hit while the server still reported more
+    /// pages; the result is incomplete. Only set when the server explicitly
+    /// reported more pages via its pagination headers.
+    pub truncated: bool,
+    /// Total number of items returned across all fetched pages.
+    pub count: usize,
+}
+
+impl AutoPagination {
+    fn from_bounded<T>(bounded: &BoundedPage<T>) -> Self {
+        Self {
+            pages_read: bounded.pages_read,
+            page_cap: bounded.page_cap,
+            truncated: bounded.truncated,
+            count: bounded.items.len(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ProjectListResult {
     pub projects: Vec<Project>,
     pub pagination: PageInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_pagination: Option<AutoPagination>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TaskListResult {
     pub tasks: Vec<Task>,
     pub pagination: PageInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_pagination: Option<AutoPagination>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct LabelListResult {
     pub labels: Vec<Label>,
     pub pagination: PageInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_pagination: Option<AutoPagination>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct TeamListResult {
     pub teams: Vec<Team>,
     pub pagination: PageInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_pagination: Option<AutoPagination>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -423,6 +500,8 @@ pub struct CommentListResult {
 pub struct AttachmentListResult {
     pub attachments: Vec<TaskAttachment>,
     pub pagination: PageInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_pagination: Option<AutoPagination>,
 }
 
 /// Result of a mutation that only returns a confirmation message.
@@ -555,6 +634,42 @@ fn page_params(page: Option<u32>, per_page: Option<u32>) -> Result<PageParams, M
     Ok(PageParams::new(page, per_page))
 }
 
+/// Validates the auto-pagination arguments of a list call before any
+/// request is made. Returns the effective page cap when auto-pagination was
+/// requested, or `None` for a plain one-page call. `auto_paginate: false`
+/// and omitting the argument are treated identically: both reject
+/// `max_pages`.
+fn auto_page_cap(
+    page: Option<u32>,
+    auto_paginate: Option<bool>,
+    max_pages: Option<u32>,
+) -> Result<Option<u32>, McpError> {
+    if auto_paginate != Some(true) {
+        if max_pages.is_some() {
+            return Err(Error::InvalidArgument(
+                "max_pages requires auto_paginate: true".to_string(),
+            )
+            .to_mcp());
+        }
+        return Ok(None);
+    }
+    if page.is_some() {
+        return Err(Error::InvalidArgument(
+            "page cannot be combined with auto_paginate; auto-pagination always starts at page 1"
+                .to_string(),
+        )
+        .to_mcp());
+    }
+    let cap = max_pages.unwrap_or(DEFAULT_AUTO_MAX_PAGES);
+    if !(1..=MAX_AUTO_MAX_PAGES).contains(&cap) {
+        return Err(Error::InvalidArgument(format!(
+            "max_pages must be between 1 and {MAX_AUTO_MAX_PAGES}, got {cap}"
+        ))
+        .to_mcp());
+    }
+    Ok(Some(cap))
+}
+
 fn non_empty(name: &str, value: &str) -> Result<(), McpError> {
     if value.trim().is_empty() {
         return Err(Error::InvalidArgument(format!("{name} must not be empty")).to_mcp());
@@ -651,14 +766,30 @@ impl VikunjaMcpServer {
 
     #[tool(
         name = "vikunja_projects_list",
-        description = "List or search Vikunja projects the user has access to. Returns one page of projects plus pagination info.",
+        description = "List or search Vikunja projects the user has access to. Returns one page of projects plus pagination info, or — with auto_paginate — up to max_pages pages (default 10, max 50) as one bounded result.",
         annotations(read_only_hint = true)
     )]
     pub async fn projects_list(
         &self,
         Parameters(args): Parameters<ProjectsListArgs>,
     ) -> Result<Json<ProjectListResult>, McpError> {
+        let cap = auto_page_cap(args.page, args.auto_paginate, args.max_pages)?;
         let params = page_params(args.page, args.per_page)?;
+        if let Some(cap) = cap {
+            let bounded = walk_pages(cap, |page| {
+                self.client().list_projects(
+                    PageParams::new(Some(page), args.per_page),
+                    args.search.as_deref(),
+                    args.is_archived,
+                )
+            })
+            .await?;
+            return Ok(Json(ProjectListResult {
+                pagination: bounded.last_info.clone(),
+                auto_pagination: Some(AutoPagination::from_bounded(&bounded)),
+                projects: bounded.items,
+            }));
+        }
         let page = self
             .client()
             .list_projects(params, args.search.as_deref(), args.is_archived)
@@ -666,6 +797,7 @@ impl VikunjaMcpServer {
         Ok(Json(ProjectListResult {
             projects: page.items,
             pagination: page.info,
+            auto_pagination: None,
         }))
     }
 
@@ -745,13 +877,14 @@ impl VikunjaMcpServer {
 
     #[tool(
         name = "vikunja_tasks_list",
-        description = "List or search Vikunja tasks across all projects, or within one project via project_id. Supports Vikunja filter expressions (e.g. 'done = false && priority >= 3', 'due_date < now/d+7d') and sorting.",
+        description = "List or search Vikunja tasks across all projects, or within one project via project_id. Supports Vikunja filter expressions (e.g. 'done = false && priority >= 3', 'due_date < now/d+7d') and sorting. With auto_paginate, fetches up to max_pages pages (default 10, max 50) as one bounded result.",
         annotations(read_only_hint = true)
     )]
     pub async fn tasks_list(
         &self,
         Parameters(args): Parameters<TasksListArgs>,
     ) -> Result<Json<TaskListResult>, McpError> {
+        let cap = auto_page_cap(args.page, args.auto_paginate, args.max_pages)?;
         page_params(args.page, args.per_page)?;
         if let Some(project_id) = args.project_id {
             positive("project_id", project_id)?;
@@ -765,10 +898,22 @@ impl VikunjaMcpServer {
             sort_by: args.sort_by,
             order_by: args.order_by,
         };
+        if let Some(cap) = cap {
+            let bounded = self
+                .client()
+                .list_all_tasks_with_options(&options, cap)
+                .await?;
+            return Ok(Json(TaskListResult {
+                pagination: bounded.last_info.clone(),
+                auto_pagination: Some(AutoPagination::from_bounded(&bounded)),
+                tasks: bounded.items,
+            }));
+        }
         let page = self.client().list_tasks(&options).await?;
         Ok(Json(TaskListResult {
             tasks: page.items,
             pagination: page.info,
+            auto_pagination: None,
         }))
     }
 
@@ -1129,14 +1274,29 @@ impl VikunjaMcpServer {
 
     #[tool(
         name = "vikunja_labels_list",
-        description = "List or search the user's Vikunja labels.",
+        description = "List or search the user's Vikunja labels. With auto_paginate, fetches up to max_pages pages (default 10, max 50) as one bounded result.",
         annotations(read_only_hint = true)
     )]
     pub async fn labels_list(
         &self,
         Parameters(args): Parameters<LabelsListArgs>,
     ) -> Result<Json<LabelListResult>, McpError> {
+        let cap = auto_page_cap(args.page, args.auto_paginate, args.max_pages)?;
         let params = page_params(args.page, args.per_page)?;
+        if let Some(cap) = cap {
+            let bounded = walk_pages(cap, |page| {
+                self.client().list_labels(
+                    PageParams::new(Some(page), args.per_page),
+                    args.search.as_deref(),
+                )
+            })
+            .await?;
+            return Ok(Json(LabelListResult {
+                pagination: bounded.last_info.clone(),
+                auto_pagination: Some(AutoPagination::from_bounded(&bounded)),
+                labels: bounded.items,
+            }));
+        }
         let page = self
             .client()
             .list_labels(params, args.search.as_deref())
@@ -1144,6 +1304,7 @@ impl VikunjaMcpServer {
         Ok(Json(LabelListResult {
             labels: page.items,
             pagination: page.info,
+            auto_pagination: None,
         }))
     }
 
@@ -1311,7 +1472,7 @@ impl VikunjaMcpServer {
 
     #[tool(
         name = "vikunja_task_attachments_list",
-        description = "List the attachments of a Vikunja task.",
+        description = "List the attachments of a Vikunja task. With auto_paginate, fetches up to max_pages pages (default 10, max 50) as one bounded result.",
         annotations(read_only_hint = true)
     )]
     pub async fn task_attachments_list(
@@ -1319,11 +1480,25 @@ impl VikunjaMcpServer {
         Parameters(args): Parameters<AttachmentsListArgs>,
     ) -> Result<Json<AttachmentListResult>, McpError> {
         let id = positive("task_id", args.task_id)?;
+        let cap = auto_page_cap(args.page, args.auto_paginate, args.max_pages)?;
         let params = page_params(args.page, args.per_page)?;
+        if let Some(cap) = cap {
+            let bounded = walk_pages(cap, |page| {
+                self.client()
+                    .list_task_attachments(id, PageParams::new(Some(page), args.per_page))
+            })
+            .await?;
+            return Ok(Json(AttachmentListResult {
+                pagination: bounded.last_info.clone(),
+                auto_pagination: Some(AutoPagination::from_bounded(&bounded)),
+                attachments: bounded.items,
+            }));
+        }
         let page = self.client().list_task_attachments(id, params).await?;
         Ok(Json(AttachmentListResult {
             attachments: page.items,
             pagination: page.info,
+            auto_pagination: None,
         }))
     }
 
@@ -1535,17 +1710,43 @@ impl VikunjaMcpServer {
 
     #[tool(
         name = "vikunja_teams_list",
-        description = "List Vikunja teams the user belongs to, or — with project_id — the teams that have access to a project including their permission level (0 read, 1 write, 2 admin).",
+        description = "List Vikunja teams the user belongs to, or — with project_id — the teams that have access to a project including their permission level (0 read, 1 write, 2 admin). With auto_paginate, fetches up to max_pages pages (default 10, max 50) as one bounded result.",
         annotations(read_only_hint = true)
     )]
     pub async fn teams_list(
         &self,
         Parameters(args): Parameters<TeamsListArgs>,
     ) -> Result<Json<TeamListResult>, McpError> {
+        let cap = auto_page_cap(args.page, args.auto_paginate, args.max_pages)?;
         let params = page_params(args.page, args.per_page)?;
-        let page = match args.project_id {
+        let project_id = match args.project_id {
+            Some(project_id) => Some(positive("project_id", project_id)?),
+            None => None,
+        };
+        if let Some(cap) = cap {
+            let bounded = walk_pages(cap, |page| {
+                let params = PageParams::new(Some(page), args.per_page);
+                let search = args.search.as_deref();
+                async move {
+                    match project_id {
+                        Some(project_id) => {
+                            self.client()
+                                .list_project_teams(project_id, params, search)
+                                .await
+                        }
+                        None => self.client().list_teams(params, search).await,
+                    }
+                }
+            })
+            .await?;
+            return Ok(Json(TeamListResult {
+                pagination: bounded.last_info.clone(),
+                auto_pagination: Some(AutoPagination::from_bounded(&bounded)),
+                teams: bounded.items,
+            }));
+        }
+        let page = match project_id {
             Some(project_id) => {
-                let project_id = positive("project_id", project_id)?;
                 self.client()
                     .list_project_teams(project_id, params, args.search.as_deref())
                     .await?
@@ -1559,6 +1760,7 @@ impl VikunjaMcpServer {
         Ok(Json(TeamListResult {
             teams: page.items,
             pagination: page.info,
+            auto_pagination: None,
         }))
     }
 }

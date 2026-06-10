@@ -280,8 +280,8 @@ async fn task_view(client: &VikunjaClient, view: TaskView) -> Result<ReadResourc
         "page_cap": MAX_RESOURCE_PAGES,
         "pages_read": result.pages_read,
         "truncated": result.truncated,
-        "count": result.tasks.len(),
-        "tasks": result.tasks,
+        "count": result.items.len(),
+        "tasks": result.items,
     });
     Ok(json_result(view.uri(), &body))
 }

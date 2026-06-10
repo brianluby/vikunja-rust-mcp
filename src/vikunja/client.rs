@@ -24,7 +24,7 @@ use super::models::{
     Label, LabelCreate, LabelTask, LabelUpdate, Message, Project, ProjectCreate, ProjectUpdate,
     Task, TaskAssignee, TaskComment, TaskCreate, TaskUpdate, Team, User,
 };
-use super::pagination::{Page, PageInfo, PageParams};
+use super::pagination::{BoundedPage, Page, PageInfo, PageParams, walk_pages};
 
 /// How long to wait before the single retry of an idempotent request.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -58,18 +58,6 @@ impl TaskListOptions {
             (None, None) => None,
         }
     }
-}
-
-/// Result of a bounded multi-page task listing: the concatenated tasks plus
-/// metadata about how far pagination got.
-#[derive(Debug, Clone)]
-pub struct BoundedTasks {
-    pub tasks: Vec<Task>,
-    /// Number of pages actually fetched (at least 1).
-    pub pages_read: u32,
-    /// True when the page cap was hit while the server still reported more
-    /// pages (`has_more == Some(true)` on the last fetched page).
-    pub truncated: bool,
 }
 
 /// A downloaded attachment body.
@@ -830,19 +818,11 @@ impl VikunjaClient {
 
     /// Fetches up to `max_pages` pages of projects and concatenates them.
     pub async fn list_all_projects(&self, max_pages: u32) -> Result<Vec<Project>, Error> {
-        let mut all = Vec::new();
-        let mut page = 1u32;
-        loop {
-            let result = self
-                .list_projects(PageParams::new(Some(page), None), None, None)
-                .await?;
-            all.extend(result.items);
-            if result.info.has_more != Some(true) || page >= max_pages {
-                break;
-            }
-            page += 1;
-        }
-        Ok(all)
+        let bounded = walk_pages(max_pages, |page| {
+            self.list_projects(PageParams::new(Some(page), None), None, None)
+        })
+        .await?;
+        Ok(bounded.items)
     }
 
     /// Fetches up to `max_pages` pages of tasks and concatenates them,
@@ -852,7 +832,7 @@ impl VikunjaClient {
         let result = self
             .list_all_tasks_with_options(&TaskListOptions::default(), max_pages)
             .await?;
-        Ok(result.tasks)
+        Ok(result.items)
     }
 
     /// Fetches up to `max_pages` pages of tasks matching `options`,
@@ -864,24 +844,13 @@ impl VikunjaClient {
         &self,
         options: &TaskListOptions,
         max_pages: u32,
-    ) -> Result<BoundedTasks, Error> {
-        let mut options = options.clone();
-        let mut tasks = Vec::new();
-        let mut page = 1u32;
-        loop {
+    ) -> Result<BoundedPage<Task>, Error> {
+        walk_pages(max_pages, |page| {
+            let mut options = options.clone();
             options.page = Some(page);
-            let result = self.list_tasks(&options).await?;
-            tasks.extend(result.items);
-            let has_more = result.info.has_more == Some(true);
-            if !has_more || page >= max_pages {
-                return Ok(BoundedTasks {
-                    tasks,
-                    pages_read: page,
-                    truncated: has_more,
-                });
-            }
-            page += 1;
-        }
+            async move { self.list_tasks(&options).await }
+        })
+        .await
     }
 
     /// Lightweight connectivity probe used by the status resource: requests
