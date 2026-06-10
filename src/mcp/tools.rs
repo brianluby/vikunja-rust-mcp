@@ -700,12 +700,15 @@ where
 /// Resolves an optional `*_shortcut` argument against its RFC 3339
 /// counterpart. Providing both is rejected. `clear_replacement` is what a
 /// clear shortcut produces: the zero date for updates, `None` (omit the
-/// field) for create.
+/// field) for create. Callers capture `reference` once per request so every
+/// shortcut field in one call resolves against the same instant, even when
+/// the call straddles a midnight or DST boundary.
 fn resolved_date(
     field: &'static str,
     explicit: Option<String>,
     shortcut: Option<String>,
     clear_replacement: Option<&str>,
+    reference: &DateTime<Local>,
     dates: &DateConfig,
 ) -> Result<Option<String>, McpError> {
     match (explicit, shortcut) {
@@ -715,7 +718,7 @@ fn resolved_date(
         .to_mcp()),
         (explicit, None) => Ok(explicit),
         (None, Some(expression)) => {
-            match dates::resolve(&expression, &Local::now(), dates).map_err(|e| e.to_mcp())? {
+            match dates::resolve(&expression, reference, dates).map_err(|e| e.to_mcp())? {
                 Resolution::Clear => Ok(clear_replacement.map(str::to_string)),
                 Resolution::Timestamp { datetime, .. } => {
                     Ok(Some(datetime.to_rfc3339_opts(SecondsFormat::Secs, true)))
@@ -916,12 +919,15 @@ impl VikunjaMcpServer {
     ) -> Result<Json<Task>, McpError> {
         let project_id = positive("project_id", args.project_id)?;
         non_empty("title", &args.title)?;
-        // On create, a clear shortcut omits the field entirely.
+        // On create, a clear shortcut omits the field entirely. One shared
+        // reference instant keeps all three dates consistent.
+        let reference = Local::now();
         let due_date = resolved_date(
             "due_date",
             args.due_date,
             args.due_date_shortcut,
             None,
+            &reference,
             self.dates(),
         )?;
         let start_date = resolved_date(
@@ -929,6 +935,7 @@ impl VikunjaMcpServer {
             args.start_date,
             args.start_date_shortcut,
             None,
+            &reference,
             self.dates(),
         )?;
         let end_date = resolved_date(
@@ -936,6 +943,7 @@ impl VikunjaMcpServer {
             args.end_date,
             args.end_date_shortcut,
             None,
+            &reference,
             self.dates(),
         )?;
         let body = TaskCreate {
@@ -966,12 +974,15 @@ impl VikunjaMcpServer {
         if let Some(project_id) = args.project_id {
             positive("project_id", project_id)?;
         }
-        // On update, a clear shortcut sends Vikunja's zero date.
+        // On update, a clear shortcut sends Vikunja's zero date. One shared
+        // reference instant keeps all three dates consistent.
+        let reference = Local::now();
         let due_date = resolved_date(
             "due_date",
             args.due_date,
             args.due_date_shortcut,
             Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
             self.dates(),
         )?;
         let start_date = resolved_date(
@@ -979,6 +990,7 @@ impl VikunjaMcpServer {
             args.start_date,
             args.start_date_shortcut,
             Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
             self.dates(),
         )?;
         let end_date = resolved_date(
@@ -986,6 +998,7 @@ impl VikunjaMcpServer {
             args.end_date,
             args.end_date_shortcut,
             Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
             self.dates(),
         )?;
         let patch = TaskUpdate {
@@ -1140,13 +1153,16 @@ impl VikunjaMcpServer {
         if let Some(project_id) = args.project_id {
             positive("project_id", project_id)?;
         }
-        // Shortcuts resolve once and the same RFC 3339 value is applied to
-        // every listed task; a clear shortcut sends Vikunja's zero date.
+        // Shortcuts resolve once against one shared reference instant and
+        // the same RFC 3339 value is applied to every listed task; a clear
+        // shortcut sends Vikunja's zero date.
+        let reference = Local::now();
         let due_date = resolved_date(
             "due_date",
             args.due_date,
             args.due_date_shortcut,
             Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
             self.dates(),
         )?;
         let start_date = resolved_date(
@@ -1154,6 +1170,7 @@ impl VikunjaMcpServer {
             args.start_date,
             args.start_date_shortcut,
             Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
             self.dates(),
         )?;
         let end_date = resolved_date(
@@ -1161,6 +1178,7 @@ impl VikunjaMcpServer {
             args.end_date,
             args.end_date_shortcut,
             Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
             self.dates(),
         )?;
         let patch = TaskUpdate {
