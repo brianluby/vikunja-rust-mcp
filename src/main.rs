@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let client = VikunjaClient::new(&config).context("failed to initialize Vikunja client")?;
-    let server = VikunjaMcpServer::new(client);
+    let server = VikunjaMcpServer::new(client).with_date_config(config.dates);
 
     match cli.transport {
         Transport::Stdio => {
