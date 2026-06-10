@@ -11,6 +11,8 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use url::Url;
 
+use crate::dates::{DateConfig, parse_time_of_day};
+
 /// Transport over which the MCP server is exposed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Transport {
@@ -69,6 +71,15 @@ pub struct Cli {
     /// Vikunja instances cap this server-side (50 by default).
     #[arg(long, default_value_t = 50, env = "VIKUNJA_DEFAULT_PAGE_SIZE")]
     pub default_page_size: u32,
+
+    /// Time of day (HH:MM) applied when a date shortcut resolves to a
+    /// calendar day, e.g. `tomorrow` -> tomorrow at this time.
+    #[arg(long, default_value = "09:00", env = "VIKUNJA_DATE_DEFAULT_TIME")]
+    pub date_default_time: String,
+
+    /// Time of day (HH:MM) used by the `end of week` date shortcut.
+    #[arg(long, default_value = "23:59", env = "VIKUNJA_DATE_END_OF_DAY_TIME")]
+    pub date_end_of_day_time: String,
 }
 
 /// A Vikunja API token that redacts itself in all formatting output.
@@ -120,6 +131,8 @@ pub enum ConfigError {
     InvalidTimeout,
     #[error("default page size must be between 1 and 250")]
     InvalidPageSize,
+    #[error("{flag}: {reason}")]
+    InvalidTimeOfDay { flag: &'static str, reason: String },
     #[error("MCP_HTTP_AUTH_TOKEN is set but empty")]
     EmptyHttpAuthToken,
     #[error(
@@ -165,6 +178,8 @@ pub struct Config {
     pub api_token: ApiToken,
     pub timeout: Duration,
     pub default_page_size: u32,
+    /// Times of day applied by date shortcuts.
+    pub dates: DateConfig,
 }
 
 impl Config {
@@ -195,11 +210,27 @@ impl Config {
             return Err(ConfigError::InvalidPageSize);
         }
 
+        let dates = DateConfig {
+            default_time: parse_time_of_day(&cli.date_default_time).map_err(|reason| {
+                ConfigError::InvalidTimeOfDay {
+                    flag: "VIKUNJA_DATE_DEFAULT_TIME",
+                    reason,
+                }
+            })?,
+            end_of_day_time: parse_time_of_day(&cli.date_end_of_day_time).map_err(|reason| {
+                ConfigError::InvalidTimeOfDay {
+                    flag: "VIKUNJA_DATE_END_OF_DAY_TIME",
+                    reason,
+                }
+            })?,
+        };
+
         Ok(Self {
             vikunja_url,
             api_token: ApiToken::new(token),
             timeout: Duration::from_secs(cli.timeout_secs),
             default_page_size: cli.default_page_size,
+            dates,
         })
     }
 }
@@ -366,6 +397,61 @@ mod tests {
                 Config::from_cli(&cli),
                 Err(ConfigError::InvalidPageSize)
             ));
+        }
+    }
+
+    #[test]
+    fn date_times_default_to_nine_and_end_of_day() {
+        let cli = cli(&["--vikunja-url", "https://example.com", "--api-token", "t"]);
+        let config = Config::from_cli(&cli).unwrap();
+        assert_eq!(config.dates, crate::dates::DateConfig::default());
+    }
+
+    #[test]
+    fn custom_date_times_are_parsed() {
+        let cli = cli(&[
+            "--vikunja-url",
+            "https://example.com",
+            "--api-token",
+            "t",
+            "--date-default-time",
+            "08:30",
+            "--date-end-of-day-time",
+            "22:00",
+        ]);
+        let config = Config::from_cli(&cli).unwrap();
+        assert_eq!(
+            config.dates.default_time,
+            chrono::NaiveTime::from_hms_opt(8, 30, 0).unwrap()
+        );
+        assert_eq!(
+            config.dates.end_of_day_time,
+            chrono::NaiveTime::from_hms_opt(22, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_date_times_are_rejected() {
+        for (flag, value) in [
+            ("--date-default-time", "9am"),
+            ("--date-default-time", "25:00"),
+            ("--date-end-of-day-time", "12:60"),
+            ("--date-end-of-day-time", "midnight"),
+        ] {
+            let cli = cli(&[
+                "--vikunja-url",
+                "https://example.com",
+                "--api-token",
+                "t",
+                flag,
+                value,
+            ]);
+            let err = Config::from_cli(&cli).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidTimeOfDay { .. }),
+                "{flag} {value}: {err:?}"
+            );
+            assert!(err.to_string().contains("HH:MM"), "{err}");
         }
     }
 

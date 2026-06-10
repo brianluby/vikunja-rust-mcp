@@ -4,12 +4,14 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use chrono::{DateTime, Local, SecondsFormat, TimeZone};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ErrorData as McpError, tool, tool_router};
 use schemars::JsonSchema;
 use schemars::transform::RecursiveTransform;
 use serde::{Deserialize, Serialize};
 
+use crate::dates::{self, DateConfig, Resolution};
 use crate::error::{ApiErrorKind, Error};
 use crate::schema::strip_unsigned_formats;
 use crate::vikunja::client::TaskListOptions;
@@ -128,6 +130,14 @@ pub struct TasksCreateArgs {
     pub start_date: Option<String>,
     /// End date as RFC 3339.
     pub end_date: Option<String>,
+    /// Date shortcut for the due date, e.g. `tomorrow`, `next friday`,
+    /// `in 2 weeks`, `end of week`, `2026-07-01`. Mutually exclusive with
+    /// due_date; `clear`/`none` leave the date unset.
+    pub due_date_shortcut: Option<String>,
+    /// Date shortcut for the start date. Mutually exclusive with start_date.
+    pub start_date_shortcut: Option<String>,
+    /// Date shortcut for the end date. Mutually exclusive with end_date.
+    pub end_date_shortcut: Option<String>,
     /// Priority: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 DO NOW.
     pub priority: Option<i64>,
     /// Completion fraction between 0 and 1 (0.5 = 50%).
@@ -156,6 +166,14 @@ pub struct TasksUpdateArgs {
     pub start_date: Option<String>,
     /// New end date as RFC 3339.
     pub end_date: Option<String>,
+    /// Date shortcut for the due date, e.g. `tomorrow`, `next friday`,
+    /// `in 2 weeks`, `end of week`, `2026-07-01`. Mutually exclusive with
+    /// due_date; `clear`/`none` clear the date.
+    pub due_date_shortcut: Option<String>,
+    /// Date shortcut for the start date. Mutually exclusive with start_date.
+    pub start_date_shortcut: Option<String>,
+    /// Date shortcut for the end date. Mutually exclusive with end_date.
+    pub end_date_shortcut: Option<String>,
     /// Priority: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 DO NOW.
     pub priority: Option<i64>,
     /// Completion fraction between 0 and 1.
@@ -203,6 +221,14 @@ pub struct TasksBulkUpdateArgs {
     pub start_date: Option<String>,
     /// New end date as RFC 3339.
     pub end_date: Option<String>,
+    /// Date shortcut for the due date, e.g. `tomorrow`, `next friday`,
+    /// `in 2 weeks`, `end of week`, `2026-07-01`. Mutually exclusive with
+    /// due_date; `clear`/`none` clear the date.
+    pub due_date_shortcut: Option<String>,
+    /// Date shortcut for the start date. Mutually exclusive with start_date.
+    pub start_date_shortcut: Option<String>,
+    /// Date shortcut for the end date. Mutually exclusive with end_date.
+    pub end_date_shortcut: Option<String>,
     /// Priority: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 DO NOW.
     pub priority: Option<i64>,
     /// Completion fraction between 0 and 1.
@@ -383,6 +409,40 @@ pub struct TeamsListArgs {
     /// If set, list the teams with access to this project (including their
     /// permission level) instead of all teams.
     pub project_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DatesResolveArgs {
+    /// Date shortcut to preview, e.g. `tomorrow`, `next friday`,
+    /// `in 2 weeks`, `end of week`, `2026-07-01`, `clear`.
+    pub expression: String,
+    /// RFC 3339 instant to resolve against instead of the current server
+    /// time. Its UTC offset defines the timezone used for the resolution.
+    pub reference_time: Option<String>,
+    /// Which date field the expression is meant for: `due_date`,
+    /// `start_date` or `end_date`. Informational only; resolution is the
+    /// same for all targets.
+    pub target: Option<String>,
+}
+
+/// Preview of how a date shortcut resolves, without calling Vikunja.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DatesResolveResult {
+    /// The expression that was resolved.
+    pub expression: String,
+    /// Reference instant the expression was resolved against (RFC 3339).
+    pub reference_time: String,
+    /// Resolved RFC 3339 timestamp; null when the expression clears the
+    /// date.
+    pub resolved: Option<String>,
+    /// True when the expression means clear/omit the date (`clear`, `none`,
+    /// `unset`, `no due date`).
+    pub clears_date: bool,
+    /// Timezone the resolution used.
+    pub timezone_description: String,
+    /// Configured time of day (HH:MM) applied to the resolved date, when a
+    /// date was resolved.
+    pub default_time_used: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -637,6 +697,67 @@ where
     })
 }
 
+/// Resolves an optional `*_shortcut` argument against its RFC 3339
+/// counterpart. Providing both is rejected. `clear_replacement` is what a
+/// clear shortcut produces: the zero date for updates, `None` (omit the
+/// field) for create.
+fn resolved_date(
+    field: &'static str,
+    explicit: Option<String>,
+    shortcut: Option<String>,
+    clear_replacement: Option<&str>,
+    dates: &DateConfig,
+) -> Result<Option<String>, McpError> {
+    match (explicit, shortcut) {
+        (Some(_), Some(_)) => Err(Error::InvalidArgument(format!(
+            "provide either {field} or {field}_shortcut, not both"
+        ))
+        .to_mcp()),
+        (explicit, None) => Ok(explicit),
+        (None, Some(expression)) => {
+            match dates::resolve(&expression, &Local::now(), dates).map_err(|e| e.to_mcp())? {
+                Resolution::Clear => Ok(clear_replacement.map(str::to_string)),
+                Resolution::Timestamp { datetime, .. } => {
+                    Ok(Some(datetime.to_rfc3339_opts(SecondsFormat::Secs, true)))
+                }
+            }
+        }
+    }
+}
+
+/// Builds the structured output of `vikunja_dates_resolve` for a reference
+/// instant in any timezone.
+fn resolution_result<Tz: TimeZone>(
+    expression: String,
+    reference: &DateTime<Tz>,
+    timezone_description: String,
+    dates: &DateConfig,
+) -> Result<Json<DatesResolveResult>, McpError>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let (resolved, default_time_used, clears_date) =
+        match dates::resolve(&expression, reference, dates).map_err(|e| e.to_mcp())? {
+            Resolution::Clear => (None, None, true),
+            Resolution::Timestamp {
+                datetime,
+                time_of_day,
+            } => (
+                Some(datetime.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                Some(time_of_day.format("%H:%M").to_string()),
+                false,
+            ),
+        };
+    Ok(Json(DatesResolveResult {
+        expression,
+        reference_time: reference.to_rfc3339_opts(SecondsFormat::Secs, true),
+        resolved,
+        clears_date,
+        timezone_description,
+        default_time_used,
+    }))
+}
+
 fn oversized_upload(size: usize) -> Error {
     Error::InvalidArgument(format!(
         "attachment is about {size} bytes; the maximum supported upload is {MAX_UPLOAD_BYTES} bytes"
@@ -795,12 +916,34 @@ impl VikunjaMcpServer {
     ) -> Result<Json<Task>, McpError> {
         let project_id = positive("project_id", args.project_id)?;
         non_empty("title", &args.title)?;
+        // On create, a clear shortcut omits the field entirely.
+        let due_date = resolved_date(
+            "due_date",
+            args.due_date,
+            args.due_date_shortcut,
+            None,
+            self.dates(),
+        )?;
+        let start_date = resolved_date(
+            "start_date",
+            args.start_date,
+            args.start_date_shortcut,
+            None,
+            self.dates(),
+        )?;
+        let end_date = resolved_date(
+            "end_date",
+            args.end_date,
+            args.end_date_shortcut,
+            None,
+            self.dates(),
+        )?;
         let body = TaskCreate {
             title: args.title,
             description: args.description,
-            due_date: args.due_date,
-            start_date: args.start_date,
-            end_date: args.end_date,
+            due_date,
+            start_date,
+            end_date,
             priority: args.priority,
             percent_done: args.percent_done,
             hex_color: args.hex_color,
@@ -823,13 +966,35 @@ impl VikunjaMcpServer {
         if let Some(project_id) = args.project_id {
             positive("project_id", project_id)?;
         }
+        // On update, a clear shortcut sends Vikunja's zero date.
+        let due_date = resolved_date(
+            "due_date",
+            args.due_date,
+            args.due_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            self.dates(),
+        )?;
+        let start_date = resolved_date(
+            "start_date",
+            args.start_date,
+            args.start_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            self.dates(),
+        )?;
+        let end_date = resolved_date(
+            "end_date",
+            args.end_date,
+            args.end_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            self.dates(),
+        )?;
         let patch = TaskUpdate {
             title: args.title,
             description: args.description,
             done: args.done,
-            due_date: args.due_date,
-            start_date: args.start_date,
-            end_date: args.end_date,
+            due_date,
+            start_date,
+            end_date,
             priority: args.priority,
             percent_done: args.percent_done,
             project_id: args.project_id,
@@ -975,13 +1140,36 @@ impl VikunjaMcpServer {
         if let Some(project_id) = args.project_id {
             positive("project_id", project_id)?;
         }
+        // Shortcuts resolve once and the same RFC 3339 value is applied to
+        // every listed task; a clear shortcut sends Vikunja's zero date.
+        let due_date = resolved_date(
+            "due_date",
+            args.due_date,
+            args.due_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            self.dates(),
+        )?;
+        let start_date = resolved_date(
+            "start_date",
+            args.start_date,
+            args.start_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            self.dates(),
+        )?;
+        let end_date = resolved_date(
+            "end_date",
+            args.end_date,
+            args.end_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            self.dates(),
+        )?;
         let patch = TaskUpdate {
             title: args.title,
             description: args.description,
             done: args.done,
-            due_date: args.due_date,
-            start_date: args.start_date,
-            end_date: args.end_date,
+            due_date,
+            start_date,
+            end_date,
             priority: args.priority,
             percent_done: args.percent_done,
             project_id: args.project_id,
@@ -1123,6 +1311,58 @@ impl VikunjaMcpServer {
                 .map(|message| BulkOutcome::Message(message.message))
         })
         .await)
+    }
+
+    // -- Dates --
+
+    #[tool(
+        name = "vikunja_dates_resolve",
+        description = "Preview how a date shortcut resolves to an RFC 3339 timestamp without writing anything. Supported: today, tomorrow, yesterday, in N days/weeks/months, [next] monday..sunday, end of week, YYYY-MM-DD, and clear/none/unset/no due date. Use before vikunja_tasks_create/update.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn dates_resolve(
+        &self,
+        Parameters(args): Parameters<DatesResolveArgs>,
+    ) -> Result<Json<DatesResolveResult>, McpError> {
+        if let Some(target) = args.target.as_deref()
+            && !matches!(target, "due_date" | "start_date" | "end_date")
+        {
+            return Err(Error::InvalidArgument(
+                "target must be one of due_date, start_date or end_date".to_string(),
+            )
+            .to_mcp());
+        }
+        match args.reference_time.as_deref() {
+            Some(raw) => {
+                let reference = DateTime::parse_from_rfc3339(raw).map_err(|e| {
+                    Error::InvalidArgument(format!(
+                        "reference_time is not a valid RFC 3339 timestamp: {e}"
+                    ))
+                    .to_mcp()
+                })?;
+                let timezone_description = format!(
+                    "fixed UTC offset {} from reference_time",
+                    reference.offset()
+                );
+                resolution_result(
+                    args.expression,
+                    &reference,
+                    timezone_description,
+                    self.dates(),
+                )
+            }
+            None => {
+                let reference = Local::now();
+                let timezone_description =
+                    format!("server local timezone (UTC offset {})", reference.offset());
+                resolution_result(
+                    args.expression,
+                    &reference,
+                    timezone_description,
+                    self.dates(),
+                )
+            }
+        }
     }
 
     // -- Labels --
