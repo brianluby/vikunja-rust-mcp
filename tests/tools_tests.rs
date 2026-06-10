@@ -80,6 +80,9 @@ const EXPECTED_TOOLS: &[&str] = &[
     "vikunja_labels_delete",
     "vikunja_task_labels_add",
     "vikunja_task_labels_remove",
+    "vikunja_task_relations_list",
+    "vikunja_task_relations_create",
+    "vikunja_task_relations_delete",
     "vikunja_task_comments_list",
     "vikunja_task_comments_create",
     "vikunja_task_comments_update",
@@ -90,6 +93,13 @@ const EXPECTED_TOOLS: &[&str] = &[
     "vikunja_task_attachments_delete",
     "vikunja_users_search",
     "vikunja_teams_list",
+    "vikunja_filters_list",
+    "vikunja_filters_get",
+    "vikunja_filters_create",
+    "vikunja_filters_update",
+    "vikunja_filters_delete",
+    "vikunja_filters_tasks",
+    "vikunja_dates_resolve",
 ];
 
 #[tokio::test]
@@ -940,6 +950,339 @@ async fn bulk_writes_are_not_retried() {
     client.cancel().await.unwrap();
 }
 
+// ----- date shortcuts ---------------------------------------------------------
+
+/// RFC 3339 string for a local date at HH:MM, exactly as the server's
+/// resolver renders it (the e2e server runs with the default 09:00/23:59
+/// date config in the machine's local timezone).
+fn local_rfc3339(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> String {
+    use chrono::TimeZone as _;
+    let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .unwrap()
+        .and_hms_opt(hour, minute, 0)
+        .unwrap();
+    chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+#[tokio::test]
+async fn dates_resolve_previews_shortcuts_without_calling_vikunja() {
+    // Unreachable Vikunja: success proves the tool never talks to it.
+    let client = connect("http://127.0.0.1:1").await;
+
+    let result = call(
+        &client,
+        "vikunja_dates_resolve",
+        json!({
+            "expression": "in 2 days",
+            "reference_time": "2026-06-10T12:00:00Z",
+            "target": "due_date"
+        }),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["expression"], "in 2 days");
+    assert_eq!(body["reference_time"], "2026-06-10T12:00:00Z");
+    assert_eq!(body["resolved"], "2026-06-12T09:00:00Z");
+    assert_eq!(body["clears_date"], false);
+    assert_eq!(body["default_time_used"], "09:00");
+    assert!(
+        body["timezone_description"]
+            .as_str()
+            .unwrap()
+            .contains("+00:00")
+    );
+
+    // Non-UTC reference offsets are preserved in the resolution.
+    let result = call(
+        &client,
+        "vikunja_dates_resolve",
+        json!({"expression": "next friday", "reference_time": "2026-06-10T12:00:00-04:00"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured(&result)["resolved"], "2026-06-12T09:00:00-04:00");
+
+    // End of week applies the end-of-day time.
+    let result = call(
+        &client,
+        "vikunja_dates_resolve",
+        json!({"expression": "end of week", "reference_time": "2026-06-10T12:00:00Z"}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["resolved"], "2026-06-14T23:59:00Z");
+    assert_eq!(body["default_time_used"], "23:59");
+
+    // Clear words report clears_date and resolve to nothing; without a
+    // reference_time the server local timezone is used.
+    let result = call(
+        &client,
+        "vikunja_dates_resolve",
+        json!({"expression": "no due date"}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["clears_date"], true);
+    assert!(body["resolved"].is_null());
+    assert!(body["default_time_used"].is_null());
+    assert!(
+        body["timezone_description"]
+            .as_str()
+            .unwrap()
+            .contains("server local timezone")
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn dates_resolve_rejects_invalid_input() {
+    let client = connect("http://127.0.0.1:1").await;
+
+    let err = call(
+        &client,
+        "vikunja_dates_resolve",
+        json!({"expression": "someday"}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(data.message.contains("unsupported date shortcut"));
+    assert!(data.message.contains("in N days"));
+
+    let err = call(
+        &client,
+        "vikunja_dates_resolve",
+        json!({"expression": "today", "reference_time": "yesterday"}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("RFC 3339"));
+
+    let err = call(
+        &client,
+        "vikunja_dates_resolve",
+        json!({"expression": "today", "target": "title"}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("target"));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn tasks_create_resolves_shortcuts_before_sending() {
+    let expected_due = local_rfc3339(2026, 7, 1, 9, 0);
+    let server = MockServer::start().await;
+    // Exact body: the shortcut arrives as a resolved RFC 3339 due_date and
+    // the `none` start date shortcut omits the field entirely.
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/3/tasks"))
+        .and(body_json(
+            json!({"title": "Ship", "due_date": expected_due}),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 60, "title": "Ship", "project_id": 3, "due_date": expected_due
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_tasks_create",
+        json!({
+            "project_id": 3,
+            "title": "Ship",
+            "due_date_shortcut": "2026-07-01",
+            "start_date_shortcut": "none"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["id"], 60);
+    assert_eq!(body["due_date"], expected_due);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn tasks_update_shortcut_preserves_fields_via_read_merge_write() {
+    let expected_due = local_rfc3339(2026, 7, 1, 9, 0);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3, "priority": 2
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The merged write carries the resolved RFC 3339 value and every field
+    // from the GET.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3, "priority": 2,
+            "due_date": expected_due
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3, "priority": 2,
+            "due_date": expected_due
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_tasks_update",
+        json!({"task_id": 9, "due_date_shortcut": "2026-07-01"}),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(structured(&result)["due_date"], expected_due);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn tasks_update_clear_shortcut_sends_zero_date() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "T", "done": false, "project_id": 3,
+            "due_date": "2026-07-01T09:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "T", "done": false, "project_id": 3,
+            "due_date": "0001-01-01T00:00:00Z"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "T", "done": false, "project_id": 3
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    call(
+        &client,
+        "vikunja_tasks_update",
+        json!({"task_id": 9, "due_date_shortcut": "clear"}),
+    )
+    .await
+    .unwrap();
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_update_applies_date_shortcut_per_task() {
+    let server = MockServer::start().await;
+    for id in [7, 8] {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/tasks/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": id, "title": "Task", "done": false, "project_id": 3,
+                "due_date": "2026-07-01T09:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/v1/tasks/{id}")))
+            .and(body_json(json!({
+                "id": id, "title": "Task", "done": false, "project_id": 3,
+                "due_date": "0001-01-01T00:00:00Z"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": id, "title": "Task", "done": false, "project_id": 3
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_tasks_bulk_update",
+        json!({"task_ids": [7, 8], "due_date_shortcut": "clear"}),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["succeeded"], 2);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn date_and_shortcut_together_are_rejected() {
+    let client = connect("http://127.0.0.1:1").await;
+    for (tool, args) in [
+        (
+            "vikunja_tasks_create",
+            json!({
+                "project_id": 3, "title": "X",
+                "due_date": "2026-07-01T09:00:00Z", "due_date_shortcut": "tomorrow"
+            }),
+        ),
+        (
+            "vikunja_tasks_update",
+            json!({
+                "task_id": 9,
+                "start_date": "2026-07-01T09:00:00Z", "start_date_shortcut": "today"
+            }),
+        ),
+        (
+            "vikunja_tasks_bulk_update",
+            json!({
+                "task_ids": [1],
+                "end_date": "2026-07-01T09:00:00Z", "end_date_shortcut": "friday"
+            }),
+        ),
+    ] {
+        let err = call(&client, tool, args).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error for {tool}");
+        };
+        assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{tool}");
+        assert!(
+            data.message.contains("not both"),
+            "{tool}: {}",
+            data.message
+        );
+    }
+    client.cancel().await.unwrap();
+}
+
 // ----- attachments through the tool layer ------------------------------------
 
 #[tokio::test]
@@ -1256,7 +1599,7 @@ async fn resources_are_listed_and_readable() {
     assert!(uris.contains(&"vikunja://tasks"));
 
     let templates = client.list_resource_templates(None).await.unwrap();
-    assert_eq!(templates.resource_templates.len(), 2);
+    assert_eq!(templates.resource_templates.len(), 4);
 
     // Status resource: reports config without leaking the token.
     let status = client
@@ -2052,6 +2395,616 @@ async fn malformed_template_ids_are_not_found() {
             "{uri}"
         );
     }
+    client.cancel().await.unwrap();
+}
+
+// ----- saved filters ------------------------------------------------------------
+
+fn saved_filter_json(id: i64, title: &str, filter: &str) -> serde_json::Value {
+    json!({
+        "id": id, "title": title, "description": "open work",
+        "filters": {
+            "sort_by": ["due_date", "id"],
+            "order_by": ["asc", "desc"],
+            "filter": filter,
+            "filter_timezone": "America/Los_Angeles",
+            "filter_include_nulls": false
+        },
+        "owner": {"id": 1, "username": "ada"},
+        "is_favorite": false,
+        "created": "2026-01-01T00:00:00Z", "updated": "2026-01-02T00:00:00Z"
+    })
+}
+
+#[tokio::test]
+async fn filters_crud_round_trips() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/filters"))
+        .and(body_json(json!({
+            "title": "Open work",
+            "filters": {"filter": "done = false", "sort_by": ["due_date"], "order_by": ["asc"]}
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Renamed",
+            "done = false",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"message": "Successfully deleted."})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let created = call(
+        &client,
+        "vikunja_filters_create",
+        json!({
+            "title": "Open work", "filter": "done = false",
+            "sort_by": ["due_date"], "order_by": ["asc"]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured(&created)["id"], 9);
+
+    let fetched = call(&client, "vikunja_filters_get", json!({"filter_id": 9}))
+        .await
+        .unwrap();
+    let body = structured(&fetched);
+    assert_eq!(body["title"], "Open work");
+    assert_eq!(body["filters"]["filter"], "done = false");
+
+    let updated = call(
+        &client,
+        "vikunja_filters_update",
+        json!({"filter_id": 9, "title": "Renamed"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured(&updated)["title"], "Renamed");
+
+    let deleted = call(&client, "vikunja_filters_delete", json!({"filter_id": 9}))
+        .await
+        .unwrap();
+    assert_eq!(structured(&deleted)["ok"], true);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn filters_list_derives_from_pseudo_projects() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 1, "title": "Inbox"},
+            {"id": -2, "title": "Open work", "description": "open", "is_favorite": true},
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(&client, "vikunja_filters_list", json!({}))
+        .await
+        .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["filters"].as_array().unwrap().len(), 1);
+    assert_eq!(body["filters"][0]["filter_id"], 1);
+    assert_eq!(body["filters"][0]["pseudo_project_id"], -2);
+    assert_eq!(body["filters"][0]["title"], "Open work");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn filters_tasks_executes_stored_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("filter", "done = false"))
+        .and(query_param("sort_by", "due_date"))
+        .and(query_param("order_by", "asc"))
+        .and(query_param("filter_timezone", "America/Los_Angeles"))
+        .and(query_param("filter_include_nulls", "false"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 4, "title": "Pay rent", "project_id": 1}]))
+                .insert_header("x-pagination-total-pages", "1")
+                .insert_header("x-pagination-result-count", "1"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(&client, "vikunja_filters_tasks", json!({"filter_id": 9}))
+        .await
+        .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["filter_id"], 9);
+    assert_eq!(body["title"], "Open work");
+    assert_eq!(body["filter"], "done = false");
+    assert_eq!(body["tasks"][0]["title"], "Pay rent");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn filters_validation_rejects_bad_arguments_before_any_request() {
+    // Unreachable address: a request would fail loudly, proving validation
+    // rejected the call first.
+    let client = connect("http://127.0.0.1:1").await;
+    let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+        (
+            "vikunja_filters_create",
+            json!({"title": "   ", "filter": "done = false"}),
+            "title",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({"title": "Open", "filter": "   "}),
+            "filter",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({"title": "Open", "filter": "(done = false"}),
+            "parenthes",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({"title": "Open", "filter": "done = false)"}),
+            "parenthes",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({"title": "Open", "filter": "title ~ 'unterminated"}),
+            "quote",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({
+                "title": "Open", "filter": "done = false",
+                "sort_by": ["due_date", "id"], "order_by": ["asc"]
+            }),
+            "same number",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({
+                "title": "Open", "filter": "done = false",
+                "sort_by": ["due_date"], "order_by": ["upward"]
+            }),
+            "'asc' or 'desc'",
+        ),
+        (
+            "vikunja_filters_create",
+            json!({"title": "Open", "filter": "done = false", "filter_timezone": "  "}),
+            "filter_timezone",
+        ),
+        ("vikunja_filters_get", json!({"filter_id": 0}), "positive"),
+        (
+            "vikunja_filters_update",
+            json!({"filter_id": 9, "filter": "((done = false)"}),
+            "parenthes",
+        ),
+        (
+            "vikunja_filters_update",
+            json!({"filter_id": 9}),
+            "nothing to update",
+        ),
+        (
+            "vikunja_filters_delete",
+            json!({"filter_id": -3}),
+            "positive",
+        ),
+        (
+            "vikunja_filters_tasks",
+            json!({"filter_id": 9, "page": 0}),
+            "page",
+        ),
+    ];
+    for (tool, args, expected) in cases {
+        let err = call(&client, tool, args.clone()).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error for {tool} {args}");
+        };
+        assert!(
+            data.message.contains(expected),
+            "{tool} {args}: expected '{expected}' in '{}'",
+            data.message
+        );
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn filter_resources_are_listed_and_readable() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([
+                    {"id": 1, "title": "Inbox"},
+                    {"id": -10, "title": "Open work"},
+                ]))
+                .insert_header("x-pagination-total-pages", "1"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/filters/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(saved_filter_json(
+            9,
+            "Open work",
+            "done = false",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("filter", "done = false"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 4, "title": "Pay rent", "project_id": 1}]))
+                .insert_header("x-pagination-total-pages", "1"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let resources = client.list_resources(None).await.unwrap();
+    let uris: Vec<&str> = resources
+        .resources
+        .iter()
+        .map(|r| r.raw.uri.as_str())
+        .collect();
+    assert!(uris.contains(&"vikunja://filters"));
+
+    let templates = client.list_resource_templates(None).await.unwrap();
+    let template_uris: Vec<&str> = templates
+        .resource_templates
+        .iter()
+        .map(|t| t.raw.uri_template.as_str())
+        .collect();
+    assert!(template_uris.contains(&"vikunja://filters/{id}"));
+    assert!(template_uris.contains(&"vikunja://filters/{id}/tasks"));
+
+    // Saved filter list resource (from pseudo-projects).
+    let list = client
+        .read_resource(ReadResourceRequestParams::new("vikunja://filters"))
+        .await
+        .unwrap();
+    let ResourceContents::TextResourceContents { text, .. } = &list.contents[0] else {
+        panic!("expected text contents");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["count"], 1);
+    assert_eq!(parsed["filters"][0]["filter_id"], 9);
+    assert_eq!(parsed["filters"][0]["pseudo_project_id"], -10);
+
+    // One saved filter definition.
+    let one = client
+        .read_resource(ReadResourceRequestParams::new("vikunja://filters/9"))
+        .await
+        .unwrap();
+    let ResourceContents::TextResourceContents { text, .. } = &one.contents[0] else {
+        panic!("expected text contents");
+    };
+    assert!(text.contains("done = false"));
+
+    // Tasks matching the saved filter.
+    let tasks = client
+        .read_resource(ReadResourceRequestParams::new("vikunja://filters/9/tasks"))
+        .await
+        .unwrap();
+    let ResourceContents::TextResourceContents { text, .. } = &tasks.contents[0] else {
+        panic!("expected text contents");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed["filter_id"], 9);
+    assert_eq!(parsed["filter"], "done = false");
+    assert_eq!(parsed["count"], 1);
+    assert_eq!(parsed["tasks"][0]["title"], "Pay rent");
+
+    client.cancel().await.unwrap();
+}
+
+// ----- task relations ---------------------------------------------------------
+
+#[tokio::test]
+async fn task_relations_create_and_delete_round_trip() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/tasks/5/relations"))
+        .and(body_json(json!({
+            "task_id": 5, "other_task_id": 9, "relation_kind": "blocking"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "task_id": 5, "other_task_id": 9, "relation_kind": "blocking",
+            "created": "2026-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/tasks/5/relations/blocking/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": "The task relation was successfully deleted."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let created = call(
+        &client,
+        "vikunja_task_relations_create",
+        json!({"task_id": 5, "other_task_id": 9, "relation_kind": "blocking"}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&created);
+    assert_eq!(body["task_id"], 5);
+    assert_eq!(body["other_task_id"], 9);
+    assert_eq!(body["relation_kind"], "blocking");
+
+    let deleted = call(
+        &client,
+        "vikunja_task_relations_delete",
+        json!({"task_id": 5, "other_task_id": 9, "relation_kind": "blocking"}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&deleted);
+    assert_eq!(body["ok"], true);
+    assert!(body["message"].as_str().unwrap().contains("deleted"));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_list_groups_relations_by_kind() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 7, "title": "parent", "project_id": 3,
+            "related_tasks": {
+                "subtask": [
+                    {"id": 11, "title": "child a", "project_id": 3},
+                    {"id": 12, "title": "child b", "project_id": 3, "done": true}
+                ],
+                "blocking": [
+                    {"id": 9, "title": "blocker", "project_id": 3}
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_relations_list",
+        json!({"task_id": 7}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["task_id"], 7);
+    let relations = body["relations"].as_array().unwrap();
+    assert_eq!(relations.len(), 2);
+    // BTreeMap ordering: "blocking" sorts before "subtask".
+    assert_eq!(relations[0]["relation_kind"], "blocking");
+    assert_eq!(relations[0]["tasks"][0]["id"], 9);
+    assert_eq!(relations[1]["relation_kind"], "subtask");
+    assert_eq!(relations[1]["tasks"].as_array().unwrap().len(), 2);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_list_returns_empty_for_task_without_relations() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/8"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 8, "title": "lonely", "project_id": 3
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_task_relations_list",
+        json!({"task_id": 8}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["task_id"], 8);
+    assert_eq!(body["relations"].as_array().unwrap().len(), 0);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_reject_self_relation() {
+    // Unreachable Vikunja: validation must fire before any request.
+    let client = connect("http://127.0.0.1:1").await;
+    for tool in [
+        "vikunja_task_relations_create",
+        "vikunja_task_relations_delete",
+    ] {
+        let err = call(
+            &client,
+            tool,
+            json!({"task_id": 5, "other_task_id": 5, "relation_kind": "related"}),
+        )
+        .await
+        .unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error from {tool}, got {err:?}");
+        };
+        assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(data.message.contains("other_task_id"));
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_reject_invalid_kind() {
+    let client = connect("http://127.0.0.1:1").await;
+    for kind in ["unknown", "blocks", ""] {
+        let err = call(
+            &client,
+            "vikunja_task_relations_create",
+            json!({"task_id": 5, "other_task_id": 9, "relation_kind": kind}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ServiceError::McpError(_)),
+            "kind {kind:?} should be rejected, got {err:?}"
+        );
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_reject_nonpositive_ids() {
+    let client = connect("http://127.0.0.1:1").await;
+    for (tool, args) in [
+        (
+            "vikunja_task_relations_create",
+            json!({"task_id": 0, "other_task_id": 9, "relation_kind": "related"}),
+        ),
+        (
+            "vikunja_task_relations_create",
+            json!({"task_id": 5, "other_task_id": -2, "relation_kind": "related"}),
+        ),
+        (
+            "vikunja_task_relations_delete",
+            json!({"task_id": -1, "other_task_id": 9, "relation_kind": "related"}),
+        ),
+        (
+            "vikunja_task_relations_delete",
+            json!({"task_id": 5, "other_task_id": 0, "relation_kind": "related"}),
+        ),
+        ("vikunja_task_relations_list", json!({"task_id": 0})),
+    ] {
+        let err = call(&client, tool, args).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("expected MCP error from {tool}");
+        };
+        assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(data.message.contains("task_id"));
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_tool_annotations() {
+    let client = connect("http://127.0.0.1:1").await;
+    let tools = client.list_all_tools().await.unwrap();
+
+    let list_tool = tools
+        .iter()
+        .find(|t| t.name == "vikunja_task_relations_list")
+        .unwrap();
+    assert_eq!(
+        list_tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint),
+        Some(true)
+    );
+    let delete_tool = tools
+        .iter()
+        .find(|t| t.name == "vikunja_task_relations_delete")
+        .unwrap();
+    assert_eq!(
+        delete_tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.destructive_hint),
+        Some(true)
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn task_relations_create_surfaces_already_exists_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/tasks/5/relations"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "code": 4012, "message": "The task relation already exists."
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let err = call(
+        &client,
+        "vikunja_task_relations_create",
+        json!({"task_id": 5, "other_task_id": 9, "relation_kind": "blocking"}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error, got {err:?}");
+    };
+    // A conflict is user-correctable, not a server failure: it must surface
+    // as invalid_params, like the other request-level errors.
+    assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(data.message.contains("already exists"));
+    let details = data.data.expect("error data");
+    assert_eq!(details["http_status"], 409);
+    assert_eq!(details["kind"], "conflict");
+    assert_eq!(details["vikunja_error_code"], 4012);
+    assert_eq!(details["endpoint"], "task_relations.create");
     client.cancel().await.unwrap();
 }
 

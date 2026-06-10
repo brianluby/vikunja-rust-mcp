@@ -10,6 +10,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
 
+use crate::dates::DateConfig;
 use crate::vikunja::VikunjaClient;
 
 use super::resources;
@@ -19,6 +20,7 @@ use super::resources;
 #[derive(Clone)]
 pub struct VikunjaMcpServer {
     client: Arc<VikunjaClient>,
+    dates: DateConfig,
     tool_router: ToolRouter<Self>,
 }
 
@@ -26,12 +28,24 @@ impl VikunjaMcpServer {
     pub fn new(client: VikunjaClient) -> Self {
         Self {
             client: Arc::new(client),
+            dates: DateConfig::default(),
             tool_router: Self::tool_router(),
         }
     }
 
+    /// Overrides the times of day used by date shortcuts.
+    pub fn with_date_config(mut self, dates: DateConfig) -> Self {
+        self.dates = dates;
+        self
+    }
+
     pub fn client(&self) -> &VikunjaClient {
         &self.client
+    }
+
+    /// Times of day applied when date shortcuts resolve.
+    pub fn dates(&self) -> &DateConfig {
+        &self.dates
     }
 }
 
@@ -51,14 +65,17 @@ impl ServerHandler for VikunjaMcpServer {
         .with_instructions(concat!(
             "Bridge to a Vikunja (to-do / project management) instance. ",
             "Tools cover projects, tasks, labels, assignees, comments, attachments, ",
-            "user search and teams. ",
+            "user search, teams and saved filters. ",
             "Typical flow: find a project with vikunja_projects_list, list its tasks ",
             "with vikunja_tasks_list (project_id), then create/update/complete tasks. ",
             "List tools paginate: check the `pagination` object and request further ",
             "pages via `page` until `has_more` is false. ",
             "Task filters use Vikunja syntax, e.g. 'done = false && due_date < now/d+7d'. ",
             "All ids are numeric Vikunja ids. Colors are hex without '#'. ",
-            "Dates are RFC 3339 timestamps like 2026-07-01T12:00:00Z."
+            "Dates are RFC 3339 timestamps like 2026-07-01T12:00:00Z; task ",
+            "create/update also accept date shortcuts ('tomorrow', 'next friday', ",
+            "'in 2 weeks', 'clear') via the *_shortcut fields — preview them with ",
+            "vikunja_dates_resolve."
         ))
     }
 

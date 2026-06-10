@@ -4,18 +4,21 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use chrono::{DateTime, Local, SecondsFormat, TimeZone};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ErrorData as McpError, tool, tool_router};
 use schemars::JsonSchema;
 use schemars::transform::RecursiveTransform;
 use serde::{Deserialize, Serialize};
 
+use crate::dates::{self, DateConfig, Resolution};
 use crate::error::{ApiErrorKind, Error};
 use crate::schema::strip_unsigned_formats;
-use crate::vikunja::client::TaskListOptions;
+use crate::vikunja::client::{TaskListOptions, saved_filter_options};
 use crate::vikunja::models::{
-    Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, Task, TaskAttachment,
-    TaskComment, TaskCreate, TaskUpdate, Team, User,
+    Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, RelationKind,
+    SavedFilter, SavedFilterCreate, SavedFilterQuery, SavedFilterSummary, SavedFilterUpdate, Task,
+    TaskAttachment, TaskComment, TaskCreate, TaskRelation, TaskUpdate, Team, User,
 };
 use crate::vikunja::pagination::{BoundedPage, PageInfo, PageParams, walk_pages};
 
@@ -36,6 +39,10 @@ pub const DEFAULT_AUTO_MAX_PAGES: u32 = 10;
 /// Hard upper bound on `max_pages`, so one tool call can never trigger an
 /// unbounded number of Vikunja requests.
 pub const MAX_AUTO_MAX_PAGES: u32 = 50;
+/// Page cap when walking the project list to enumerate saved filters
+/// (Vikunja has no `GET /filters` list endpoint). With the default page
+/// size of 50 this covers 500 entries.
+pub const MAX_FILTER_LIST_PAGES: u32 = 10;
 
 // ----- Shared argument/output shapes ----------------------------------------
 
@@ -148,6 +155,14 @@ pub struct TasksCreateArgs {
     pub start_date: Option<String>,
     /// End date as RFC 3339.
     pub end_date: Option<String>,
+    /// Date shortcut for the due date, e.g. `tomorrow`, `next friday`,
+    /// `in 2 weeks`, `end of week`, `2026-07-01`. Mutually exclusive with
+    /// due_date; `clear`/`none` leave the date unset.
+    pub due_date_shortcut: Option<String>,
+    /// Date shortcut for the start date. Mutually exclusive with start_date.
+    pub start_date_shortcut: Option<String>,
+    /// Date shortcut for the end date. Mutually exclusive with end_date.
+    pub end_date_shortcut: Option<String>,
     /// Priority: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 DO NOW.
     pub priority: Option<i64>,
     /// Completion fraction between 0 and 1 (0.5 = 50%).
@@ -176,6 +191,14 @@ pub struct TasksUpdateArgs {
     pub start_date: Option<String>,
     /// New end date as RFC 3339.
     pub end_date: Option<String>,
+    /// Date shortcut for the due date, e.g. `tomorrow`, `next friday`,
+    /// `in 2 weeks`, `end of week`, `2026-07-01`. Mutually exclusive with
+    /// due_date; `clear`/`none` clear the date.
+    pub due_date_shortcut: Option<String>,
+    /// Date shortcut for the start date. Mutually exclusive with start_date.
+    pub start_date_shortcut: Option<String>,
+    /// Date shortcut for the end date. Mutually exclusive with end_date.
+    pub end_date_shortcut: Option<String>,
     /// Priority: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 DO NOW.
     pub priority: Option<i64>,
     /// Completion fraction between 0 and 1.
@@ -223,6 +246,14 @@ pub struct TasksBulkUpdateArgs {
     pub start_date: Option<String>,
     /// New end date as RFC 3339.
     pub end_date: Option<String>,
+    /// Date shortcut for the due date, e.g. `tomorrow`, `next friday`,
+    /// `in 2 weeks`, `end of week`, `2026-07-01`. Mutually exclusive with
+    /// due_date; `clear`/`none` clear the date.
+    pub due_date_shortcut: Option<String>,
+    /// Date shortcut for the start date. Mutually exclusive with start_date.
+    pub start_date_shortcut: Option<String>,
+    /// Date shortcut for the end date. Mutually exclusive with end_date.
+    pub end_date_shortcut: Option<String>,
     /// Priority: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 DO NOW.
     pub priority: Option<i64>,
     /// Completion fraction between 0 and 1.
@@ -316,6 +347,18 @@ pub struct TaskLabelArgs {
     pub task_id: i64,
     /// Numeric id of the label (find it with vikunja_labels_list).
     pub label_id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskRelationArgs {
+    /// Numeric id of the task the relation starts from.
+    pub task_id: i64,
+    /// Numeric id of the task the relation points to. Must differ from
+    /// `task_id`.
+    pub other_task_id: i64,
+    /// Kind of the relation as seen from `task_id`, e.g. `blocking` means
+    /// `task_id` blocks `other_task_id`.
+    pub relation_kind: RelationKind,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -454,6 +497,127 @@ impl AutoPagination {
     }
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FiltersListArgs {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FilterIdArgs {
+    /// Numeric id of the saved filter (not the negative pseudo-project id;
+    /// find it with vikunja_filters_list).
+    pub filter_id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FiltersCreateArgs {
+    /// Filter title.
+    pub title: String,
+    /// Filter description.
+    pub description: Option<String>,
+    /// Vikunja filter expression to store, e.g. `done = false && priority >= 3`.
+    /// See https://vikunja.io/docs/filters.
+    pub filter: String,
+    /// Fields to sort matching tasks by, e.g. `["due_date", "id"]`.
+    pub sort_by: Option<Vec<String>>,
+    /// Sort directions matching `sort_by` position by position, e.g. `["asc"]`.
+    pub order_by: Option<Vec<String>>,
+    /// IANA timezone used to resolve relative dates like `now/d`.
+    pub filter_timezone: Option<String>,
+    /// Whether tasks with a null value in a filtered field match.
+    pub filter_include_nulls: Option<bool>,
+    /// Mark the saved filter as a favorite.
+    pub is_favorite: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FiltersUpdateArgs {
+    /// Numeric id of the saved filter to update.
+    pub filter_id: i64,
+    /// New title.
+    pub title: Option<String>,
+    /// New description.
+    pub description: Option<String>,
+    /// New filter expression (replaces the stored one; other stored query
+    /// fields keep their value).
+    pub filter: Option<String>,
+    /// New sort fields (replaces the stored list).
+    pub sort_by: Option<Vec<String>>,
+    /// New sort directions (replaces the stored list).
+    pub order_by: Option<Vec<String>>,
+    /// New timezone for relative dates.
+    pub filter_timezone: Option<String>,
+    /// Whether tasks with a null value in a filtered field match.
+    pub filter_include_nulls: Option<bool>,
+    /// Favorite (true) or unfavorite (false) the saved filter.
+    pub is_favorite: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct FilterTasksArgs {
+    /// Numeric id of the saved filter to evaluate.
+    pub filter_id: i64,
+    /// 1-based page number (default 1).
+    pub page: Option<u32>,
+    /// Items per page; the Vikunja server caps this (50 by default).
+    pub per_page: Option<u32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct SavedFilterListResult {
+    pub filters: Vec<SavedFilterSummary>,
+}
+
+/// One page of tasks matching a saved filter, plus the query that was
+/// evaluated to produce it.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FilterTasksResult {
+    pub filter_id: i64,
+    /// Title of the saved filter.
+    pub title: String,
+    /// The stored filter expression that was evaluated.
+    pub filter: Option<String>,
+    /// Sort field applied (first stored `sort_by` entry).
+    pub sort_by: Option<String>,
+    /// Sort direction applied (first stored `order_by` entry).
+    pub order_by: Option<String>,
+    pub tasks: Vec<Task>,
+    pub pagination: PageInfo,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DatesResolveArgs {
+    /// Date shortcut to preview, e.g. `tomorrow`, `next friday`,
+    /// `in 2 weeks`, `end of week`, `2026-07-01`, `clear`.
+    pub expression: String,
+    /// RFC 3339 instant to resolve against instead of the current server
+    /// time. Its UTC offset defines the timezone used for the resolution.
+    pub reference_time: Option<String>,
+    /// Which date field the expression is meant for: `due_date`,
+    /// `start_date` or `end_date`. Informational only; resolution is the
+    /// same for all targets.
+    pub target: Option<String>,
+}
+
+/// Preview of how a date shortcut resolves, without calling Vikunja.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DatesResolveResult {
+    /// The expression that was resolved.
+    pub expression: String,
+    /// Reference instant the expression was resolved against (RFC 3339).
+    pub reference_time: String,
+    /// Resolved RFC 3339 timestamp; null when the expression clears the
+    /// date.
+    pub resolved: Option<String>,
+    /// True when the expression means clear/omit the date (`clear`, `none`,
+    /// `unset`, `no due date`).
+    pub clears_date: bool,
+    /// Timezone the resolution used.
+    pub timezone_description: String,
+    /// Configured time of day (HH:MM) applied to the resolved date, when a
+    /// date was resolved.
+    pub default_time_used: Option<String>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ProjectListResult {
     pub projects: Vec<Project>,
@@ -494,6 +658,26 @@ pub struct UserListResult {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CommentListResult {
     pub comments: Vec<TaskComment>,
+}
+
+/// Tasks related to one task under a single relation kind.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TaskRelationGroup {
+    /// Relation kind as seen from the queried task, e.g. `blocking`.
+    pub relation_kind: String,
+    /// The related tasks.
+    pub tasks: Vec<Task>,
+}
+
+/// All relations of one task. `relation_kind` is a plain string here (not
+/// the [`RelationKind`] enum) so kinds added by a newer Vikunja server pass
+/// through instead of failing deserialization.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RelationListResult {
+    /// The task whose relations were listed.
+    pub task_id: i64,
+    /// Related tasks grouped by relation kind, sorted by kind.
+    pub relations: Vec<TaskRelationGroup>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -549,8 +733,8 @@ pub struct BulkTaskResult {
 #[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct BulkItemError {
     /// Error category: `auth`, `forbidden`, `not_found`, `validation`,
-    /// `rate_limited`, `server`, `network`, `timeout`, `invalid_response`,
-    /// `io`, `too_large`, `invalid_argument` or `other`.
+    /// `conflict`, `rate_limited`, `server`, `network`, `timeout`,
+    /// `invalid_response`, `io`, `too_large`, `invalid_argument` or `other`.
     pub kind: String,
     /// HTTP status reported by Vikunja, when the API answered.
     pub http_status: Option<u16>,
@@ -571,6 +755,7 @@ impl BulkItemError {
                     ApiErrorKind::Forbidden => "forbidden",
                     ApiErrorKind::NotFound => "not_found",
                     ApiErrorKind::Validation => "validation",
+                    ApiErrorKind::Conflict => "conflict",
                     ApiErrorKind::RateLimited => "rate_limited",
                     ApiErrorKind::Server => "server",
                     ApiErrorKind::Other => "other",
@@ -670,9 +855,96 @@ fn auto_page_cap(
     Ok(Some(cap))
 }
 
+/// Validates the two task ids of a relation: both positive and distinct.
+fn relation_pair(task_id: i64, other_task_id: i64) -> Result<(i64, i64), McpError> {
+    let task_id = positive("task_id", task_id)?;
+    let other_task_id = positive("other_task_id", other_task_id)?;
+    if task_id == other_task_id {
+        return Err(Error::InvalidArgument(
+            "task_id and other_task_id must be different tasks".to_string(),
+        )
+        .to_mcp());
+    }
+    Ok((task_id, other_task_id))
+}
+
 fn non_empty(name: &str, value: &str) -> Result<(), McpError> {
     if value.trim().is_empty() {
         return Err(Error::InvalidArgument(format!("{name} must not be empty")).to_mcp());
+    }
+    Ok(())
+}
+
+/// Validates the sort arguments of the saved-filter tools: Vikunja pairs
+/// `sort_by` and `order_by` positionally, so a length mismatch or a
+/// direction other than `asc`/`desc` silently misbehaves server-side and is
+/// rejected here instead.
+fn validate_sort_order(
+    sort_by: Option<&[String]>,
+    order_by: Option<&[String]>,
+) -> Result<(), McpError> {
+    if let (Some(sort), Some(order)) = (sort_by, order_by)
+        && sort.len() != order.len()
+    {
+        return Err(Error::InvalidArgument(format!(
+            "sort_by ({}) and order_by ({}) must have the same number of entries",
+            sort.len(),
+            order.len()
+        ))
+        .to_mcp());
+    }
+    for direction in order_by.unwrap_or_default() {
+        if direction != "asc" && direction != "desc" {
+            return Err(Error::InvalidArgument(format!(
+                "order_by entries must be 'asc' or 'desc', got {direction:?}"
+            ))
+            .to_mcp());
+        }
+    }
+    Ok(())
+}
+
+/// Light syntactic validation of a Vikunja filter expression. The server
+/// does not implement Vikunja's full filter grammar, but an empty
+/// expression, unbalanced parentheses or an unterminated quoted string are
+/// always invalid and are rejected before any request is sent.
+fn validate_filter_expression(name: &str, value: &str) -> Result<(), McpError> {
+    non_empty(name, value)?;
+    let mut depth: u32 = 0;
+    let mut quote: Option<char> = None;
+    for ch in value.chars() {
+        match quote {
+            Some(open) => {
+                if ch == open {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1).ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "{name} has unbalanced parentheses: ')' without a matching '('"
+                        ))
+                        .to_mcp()
+                    })?;
+                }
+                _ => {}
+            },
+        }
+    }
+    if let Some(open) = quote {
+        return Err(Error::InvalidArgument(format!(
+            "{name} has an unterminated quoted string (missing closing {open})"
+        ))
+        .to_mcp());
+    }
+    if depth != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "{name} has unbalanced parentheses: '(' without a matching ')'"
+        ))
+        .to_mcp());
     }
     Ok(())
 }
@@ -750,6 +1022,70 @@ where
         failed: total - succeeded,
         results,
     })
+}
+
+/// Resolves an optional `*_shortcut` argument against its RFC 3339
+/// counterpart. Providing both is rejected. `clear_replacement` is what a
+/// clear shortcut produces: the zero date for updates, `None` (omit the
+/// field) for create. Callers capture `reference` once per request so every
+/// shortcut field in one call resolves against the same instant, even when
+/// the call straddles a midnight or DST boundary.
+fn resolved_date(
+    field: &'static str,
+    explicit: Option<String>,
+    shortcut: Option<String>,
+    clear_replacement: Option<&str>,
+    reference: &DateTime<Local>,
+    dates: &DateConfig,
+) -> Result<Option<String>, McpError> {
+    match (explicit, shortcut) {
+        (Some(_), Some(_)) => Err(Error::InvalidArgument(format!(
+            "provide either {field} or {field}_shortcut, not both"
+        ))
+        .to_mcp()),
+        (explicit, None) => Ok(explicit),
+        (None, Some(expression)) => {
+            match dates::resolve(&expression, reference, dates).map_err(|e| e.to_mcp())? {
+                Resolution::Clear => Ok(clear_replacement.map(str::to_string)),
+                Resolution::Timestamp { datetime, .. } => {
+                    Ok(Some(datetime.to_rfc3339_opts(SecondsFormat::Secs, true)))
+                }
+            }
+        }
+    }
+}
+
+/// Builds the structured output of `vikunja_dates_resolve` for a reference
+/// instant in any timezone.
+fn resolution_result<Tz: TimeZone>(
+    expression: String,
+    reference: &DateTime<Tz>,
+    timezone_description: String,
+    dates: &DateConfig,
+) -> Result<Json<DatesResolveResult>, McpError>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let (resolved, default_time_used, clears_date) =
+        match dates::resolve(&expression, reference, dates).map_err(|e| e.to_mcp())? {
+            Resolution::Clear => (None, None, true),
+            Resolution::Timestamp {
+                datetime,
+                time_of_day,
+            } => (
+                Some(datetime.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                Some(time_of_day.format("%H:%M").to_string()),
+                false,
+            ),
+        };
+    Ok(Json(DatesResolveResult {
+        expression,
+        reference_time: reference.to_rfc3339_opts(SecondsFormat::Secs, true),
+        resolved,
+        clears_date,
+        timezone_description,
+        default_time_used,
+    }))
 }
 
 fn oversized_upload(size: usize) -> Error {
@@ -897,6 +1233,7 @@ impl VikunjaMcpServer {
             project_id: args.project_id,
             sort_by: args.sort_by,
             order_by: args.order_by,
+            ..Default::default()
         };
         if let Some(cap) = cap {
             let bounded = self
@@ -940,12 +1277,39 @@ impl VikunjaMcpServer {
     ) -> Result<Json<Task>, McpError> {
         let project_id = positive("project_id", args.project_id)?;
         non_empty("title", &args.title)?;
+        // On create, a clear shortcut omits the field entirely. One shared
+        // reference instant keeps all three dates consistent.
+        let reference = Local::now();
+        let due_date = resolved_date(
+            "due_date",
+            args.due_date,
+            args.due_date_shortcut,
+            None,
+            &reference,
+            self.dates(),
+        )?;
+        let start_date = resolved_date(
+            "start_date",
+            args.start_date,
+            args.start_date_shortcut,
+            None,
+            &reference,
+            self.dates(),
+        )?;
+        let end_date = resolved_date(
+            "end_date",
+            args.end_date,
+            args.end_date_shortcut,
+            None,
+            &reference,
+            self.dates(),
+        )?;
         let body = TaskCreate {
             title: args.title,
             description: args.description,
-            due_date: args.due_date,
-            start_date: args.start_date,
-            end_date: args.end_date,
+            due_date,
+            start_date,
+            end_date,
             priority: args.priority,
             percent_done: args.percent_done,
             hex_color: args.hex_color,
@@ -968,13 +1332,40 @@ impl VikunjaMcpServer {
         if let Some(project_id) = args.project_id {
             positive("project_id", project_id)?;
         }
+        // On update, a clear shortcut sends Vikunja's zero date. One shared
+        // reference instant keeps all three dates consistent.
+        let reference = Local::now();
+        let due_date = resolved_date(
+            "due_date",
+            args.due_date,
+            args.due_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
+            self.dates(),
+        )?;
+        let start_date = resolved_date(
+            "start_date",
+            args.start_date,
+            args.start_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
+            self.dates(),
+        )?;
+        let end_date = resolved_date(
+            "end_date",
+            args.end_date,
+            args.end_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
+            self.dates(),
+        )?;
         let patch = TaskUpdate {
             title: args.title,
             description: args.description,
             done: args.done,
-            due_date: args.due_date,
-            start_date: args.start_date,
-            end_date: args.end_date,
+            due_date,
+            start_date,
+            end_date,
             priority: args.priority,
             percent_done: args.percent_done,
             project_id: args.project_id,
@@ -1120,13 +1511,41 @@ impl VikunjaMcpServer {
         if let Some(project_id) = args.project_id {
             positive("project_id", project_id)?;
         }
+        // Shortcuts resolve once against one shared reference instant and
+        // the same RFC 3339 value is applied to every listed task; a clear
+        // shortcut sends Vikunja's zero date.
+        let reference = Local::now();
+        let due_date = resolved_date(
+            "due_date",
+            args.due_date,
+            args.due_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
+            self.dates(),
+        )?;
+        let start_date = resolved_date(
+            "start_date",
+            args.start_date,
+            args.start_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
+            self.dates(),
+        )?;
+        let end_date = resolved_date(
+            "end_date",
+            args.end_date,
+            args.end_date_shortcut,
+            Some(dates::CLEAR_DATE_RFC3339),
+            &reference,
+            self.dates(),
+        )?;
         let patch = TaskUpdate {
             title: args.title,
             description: args.description,
             done: args.done,
-            due_date: args.due_date,
-            start_date: args.start_date,
-            end_date: args.end_date,
+            due_date,
+            start_date,
+            end_date,
             priority: args.priority,
             percent_done: args.percent_done,
             project_id: args.project_id,
@@ -1270,6 +1689,58 @@ impl VikunjaMcpServer {
         .await)
     }
 
+    // -- Dates --
+
+    #[tool(
+        name = "vikunja_dates_resolve",
+        description = "Preview how a date shortcut resolves to an RFC 3339 timestamp without writing anything. Supported: today, tomorrow, yesterday, in N days/weeks/months, [next] monday..sunday, end of week, YYYY-MM-DD, and clear/none/unset/no due date. Use before vikunja_tasks_create/update.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn dates_resolve(
+        &self,
+        Parameters(args): Parameters<DatesResolveArgs>,
+    ) -> Result<Json<DatesResolveResult>, McpError> {
+        if let Some(target) = args.target.as_deref()
+            && !matches!(target, "due_date" | "start_date" | "end_date")
+        {
+            return Err(Error::InvalidArgument(
+                "target must be one of due_date, start_date or end_date".to_string(),
+            )
+            .to_mcp());
+        }
+        match args.reference_time.as_deref() {
+            Some(raw) => {
+                let reference = DateTime::parse_from_rfc3339(raw).map_err(|e| {
+                    Error::InvalidArgument(format!(
+                        "reference_time is not a valid RFC 3339 timestamp: {e}"
+                    ))
+                    .to_mcp()
+                })?;
+                let timezone_description = format!(
+                    "fixed UTC offset {} from reference_time",
+                    reference.offset()
+                );
+                resolution_result(
+                    args.expression,
+                    &reference,
+                    timezone_description,
+                    self.dates(),
+                )
+            }
+            None => {
+                let reference = Local::now();
+                let timezone_description =
+                    format!("server local timezone (UTC offset {})", reference.offset());
+                resolution_result(
+                    args.expression,
+                    &reference,
+                    timezone_description,
+                    self.dates(),
+                )
+            }
+        }
+    }
+
     // -- Labels --
 
     #[tool(
@@ -1391,6 +1862,67 @@ impl VikunjaMcpServer {
         let task_id = positive("task_id", args.task_id)?;
         let label_id = positive("label_id", args.label_id)?;
         let message = self.client().remove_task_label(task_id, label_id).await?;
+        Ok(Json(OperationResult {
+            ok: true,
+            message: message.message,
+        }))
+    }
+
+    // -- Task relations --
+
+    #[tool(
+        name = "vikunja_task_relations_list",
+        description = "List a Vikunja task's relations (subtasks, parent, blocking, ... ) grouped by relation kind.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn task_relations_list(
+        &self,
+        Parameters(args): Parameters<TaskIdArgs>,
+    ) -> Result<Json<RelationListResult>, McpError> {
+        let task_id = positive("task_id", args.task_id)?;
+        let task = self.client().get_task(task_id).await?;
+        let relations = task
+            .related_tasks
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(relation_kind, tasks)| TaskRelationGroup {
+                relation_kind,
+                tasks,
+            })
+            .collect();
+        Ok(Json(RelationListResult { task_id, relations }))
+    }
+
+    #[tool(
+        name = "vikunja_task_relations_create",
+        description = "Create a relation between two Vikunja tasks, e.g. relation_kind 'blocking' means task_id blocks other_task_id. Kinds: subtask, parenttask, related, duplicateof, duplicates, blocking, blocked, precedes, follows, copiedfrom, copiedto."
+    )]
+    pub async fn task_relations_create(
+        &self,
+        Parameters(args): Parameters<TaskRelationArgs>,
+    ) -> Result<Json<TaskRelation>, McpError> {
+        let (task_id, other_task_id) = relation_pair(args.task_id, args.other_task_id)?;
+        Ok(Json(
+            self.client()
+                .create_task_relation(task_id, other_task_id, args.relation_kind)
+                .await?,
+        ))
+    }
+
+    #[tool(
+        name = "vikunja_task_relations_delete",
+        description = "Delete a relation between two Vikunja tasks. The relation_kind must match the existing relation as seen from task_id.",
+        annotations(destructive_hint = true)
+    )]
+    pub async fn task_relations_delete(
+        &self,
+        Parameters(args): Parameters<TaskRelationArgs>,
+    ) -> Result<Json<OperationResult>, McpError> {
+        let (task_id, other_task_id) = relation_pair(args.task_id, args.other_task_id)?;
+        let message = self
+            .client()
+            .delete_task_relation(task_id, other_task_id, args.relation_kind)
+            .await?;
         Ok(Json(OperationResult {
             ok: true,
             message: message.message,
@@ -1763,6 +2295,151 @@ impl VikunjaMcpServer {
             auto_pagination: None,
         }))
     }
+
+    // -- Saved filters --
+    //
+    // Vikunja stores saved filters behind /filters/{id} but has no list
+    // endpoint; each filter also appears in the project list as a
+    // pseudo-project with id `-filter_id - 1`. The list tool resolves that
+    // mapping so agents never have to deal with negative ids.
+
+    #[tool(
+        name = "vikunja_filters_list",
+        description = "List the user's saved Vikunja filters: durable, named task queries. Returns each filter's id, title and the negative pseudo-project id Vikunja lists it under. Use vikunja_filters_get for the stored query.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn filters_list(
+        &self,
+        Parameters(_args): Parameters<FiltersListArgs>,
+    ) -> Result<Json<SavedFilterListResult>, McpError> {
+        let filters = self
+            .client()
+            .list_saved_filters(MAX_FILTER_LIST_PAGES)
+            .await?;
+        Ok(Json(SavedFilterListResult { filters }))
+    }
+
+    #[tool(
+        name = "vikunja_filters_get",
+        description = "Get one saved Vikunja filter by id, including its stored filter expression, sort order and date semantics.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn filters_get(
+        &self,
+        Parameters(args): Parameters<FilterIdArgs>,
+    ) -> Result<Json<SavedFilter>, McpError> {
+        let id = positive("filter_id", args.filter_id)?;
+        Ok(Json(self.client().get_saved_filter(id).await?))
+    }
+
+    #[tool(
+        name = "vikunja_filters_create",
+        description = "Create a saved Vikunja filter from a filter expression (e.g. 'done = false && priority >= 3') plus optional sort order. The expression is checked for balanced parentheses and quotes before the write."
+    )]
+    pub async fn filters_create(
+        &self,
+        Parameters(args): Parameters<FiltersCreateArgs>,
+    ) -> Result<Json<SavedFilter>, McpError> {
+        non_empty("title", &args.title)?;
+        validate_filter_expression("filter", &args.filter)?;
+        validate_sort_order(args.sort_by.as_deref(), args.order_by.as_deref())?;
+        if let Some(timezone) = args.filter_timezone.as_deref() {
+            non_empty("filter_timezone", timezone)?;
+        }
+        let body = SavedFilterCreate {
+            title: args.title,
+            description: args.description,
+            filters: SavedFilterQuery {
+                filter: Some(args.filter),
+                sort_by: args.sort_by,
+                order_by: args.order_by,
+                filter_timezone: args.filter_timezone,
+                filter_include_nulls: args.filter_include_nulls,
+            },
+            is_favorite: args.is_favorite,
+        };
+        Ok(Json(self.client().create_saved_filter(&body).await?))
+    }
+
+    #[tool(
+        name = "vikunja_filters_update",
+        description = "Update a saved Vikunja filter. Only provided fields change: the stored query is merged field by field, so e.g. changing the filter expression keeps the stored sort order.",
+        annotations(idempotent_hint = true)
+    )]
+    pub async fn filters_update(
+        &self,
+        Parameters(args): Parameters<FiltersUpdateArgs>,
+    ) -> Result<Json<SavedFilter>, McpError> {
+        let id = positive("filter_id", args.filter_id)?;
+        if let Some(title) = args.title.as_deref() {
+            non_empty("title", title)?;
+        }
+        if let Some(filter) = args.filter.as_deref() {
+            validate_filter_expression("filter", filter)?;
+        }
+        validate_sort_order(args.sort_by.as_deref(), args.order_by.as_deref())?;
+        if let Some(timezone) = args.filter_timezone.as_deref() {
+            non_empty("filter_timezone", timezone)?;
+        }
+        let query = SavedFilterQuery {
+            filter: args.filter,
+            sort_by: args.sort_by,
+            order_by: args.order_by,
+            filter_timezone: args.filter_timezone,
+            filter_include_nulls: args.filter_include_nulls,
+        };
+        let patch = SavedFilterUpdate {
+            title: args.title,
+            description: args.description,
+            filters: (query != SavedFilterQuery::default()).then_some(query),
+            is_favorite: args.is_favorite,
+        };
+        Ok(Json(self.client().update_saved_filter(id, &patch).await?))
+    }
+
+    #[tool(
+        name = "vikunja_filters_delete",
+        description = "Delete a saved Vikunja filter. Tasks are not affected; only the stored query is removed. This cannot be undone.",
+        annotations(destructive_hint = true)
+    )]
+    pub async fn filters_delete(
+        &self,
+        Parameters(args): Parameters<FilterIdArgs>,
+    ) -> Result<Json<OperationResult>, McpError> {
+        let id = positive("filter_id", args.filter_id)?;
+        let message = self.client().delete_saved_filter(id).await?;
+        Ok(Json(OperationResult {
+            ok: true,
+            message: message.message,
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_filters_tasks",
+        description = "List the tasks matching a saved Vikunja filter by evaluating its stored query (filter expression, timezone/null handling and the first stored sort pair). Paginated like vikunja_tasks_list.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn filters_tasks(
+        &self,
+        Parameters(args): Parameters<FilterTasksArgs>,
+    ) -> Result<Json<FilterTasksResult>, McpError> {
+        let id = positive("filter_id", args.filter_id)?;
+        page_params(args.page, args.per_page)?;
+        let filter = self.client().get_saved_filter(id).await?;
+        let mut options = saved_filter_options(&filter);
+        options.page = args.page;
+        options.per_page = args.per_page;
+        let page = self.client().list_tasks(&options).await?;
+        Ok(Json(FilterTasksResult {
+            filter_id: id,
+            title: filter.title,
+            filter: options.filter,
+            sort_by: options.sort_by,
+            order_by: options.order_by,
+            tasks: page.items,
+            pagination: page.info,
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -1854,6 +2531,67 @@ mod tests {
             assert_eq!(detail.vikunja_error_code, None);
             assert!(!detail.message.is_empty());
         }
+    }
+
+    #[test]
+    fn validate_filter_expression_accepts_well_formed_expressions() {
+        for expression in [
+            "done = false",
+            "(done = false) && priority >= 3",
+            "title ~ 'has (parens) inside'",
+            "title ~ \"it's quoted\"",
+            "due_date < now/d+7d",
+        ] {
+            assert!(
+                validate_filter_expression("filter", expression).is_ok(),
+                "{expression} should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_filter_expression_rejects_malformed_expressions() {
+        for (expression, expected) in [
+            ("", "empty"),
+            ("   ", "empty"),
+            ("(done = false", "parenthes"),
+            ("done = false)", "parenthes"),
+            ("((done = false) && x = 1", "parenthes"),
+            ("title ~ 'unterminated", "quote"),
+            ("title ~ \"unterminated", "quote"),
+        ] {
+            let err = validate_filter_expression("filter", expression).unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(
+                err.message.contains(expected),
+                "{expression:?}: expected '{expected}' in '{}'",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn validate_sort_order_checks_lengths_and_directions() {
+        let fields = |items: &[&str]| items.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert!(validate_sort_order(None, None).is_ok());
+        assert!(validate_sort_order(Some(&fields(&["due_date"])), None).is_ok());
+        assert!(validate_sort_order(Some(&fields(&["due_date"])), Some(&fields(&["asc"]))).is_ok());
+        assert!(
+            validate_sort_order(
+                Some(&fields(&["due_date", "id"])),
+                Some(&fields(&["asc", "desc"]))
+            )
+            .is_ok()
+        );
+
+        let mismatch =
+            validate_sort_order(Some(&fields(&["due_date", "id"])), Some(&fields(&["asc"])))
+                .unwrap_err();
+        assert!(mismatch.message.contains("same number"));
+
+        let bad_direction = validate_sort_order(None, Some(&fields(&["upward"]))).unwrap_err();
+        assert!(bad_direction.message.contains("'asc' or 'desc'"));
     }
 
     #[test]

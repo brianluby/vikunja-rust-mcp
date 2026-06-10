@@ -6,6 +6,8 @@
 //! rest. Write payloads are separate types so that `None` fields are omitted
 //! from request bodies.
 
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
 use schemars::transform::RecursiveTransform;
 use serde::{Deserialize, Serialize};
@@ -187,6 +189,78 @@ pub struct Task {
     pub created: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated: Option<String>,
+    /// Related tasks grouped by relation kind, as returned by
+    /// `GET /tasks/{id}`. Keys are kept as strings so kinds added by a newer
+    /// Vikunja server do not break deserialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_tasks: Option<BTreeMap<String, Vec<Task>>>,
+}
+
+/// Kind of a relation between two tasks (`models.RelationKind`). Vikunja's
+/// `unknown` kind is intentionally not accepted: it is never valid in a
+/// create or delete request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+// `lowercase` folds multi-word variants without separators (`ParentTask` ->
+// `parenttask`), matching Vikunja exactly; `as_str` must stay in sync.
+#[serde(rename_all = "lowercase")]
+pub enum RelationKind {
+    /// The other task is a subtask of this task.
+    Subtask,
+    /// The other task is the parent of this task.
+    ParentTask,
+    /// The tasks are loosely related.
+    Related,
+    /// This task is a duplicate of the other task.
+    DuplicateOf,
+    /// The other task duplicates this task.
+    Duplicates,
+    /// This task blocks the other task.
+    Blocking,
+    /// This task is blocked by the other task.
+    Blocked,
+    /// This task precedes the other task.
+    Precedes,
+    /// This task follows the other task.
+    Follows,
+    /// This task was copied from the other task.
+    CopiedFrom,
+    /// The other task was copied from this task.
+    CopiedTo,
+}
+
+impl RelationKind {
+    /// The lowercase string Vikunja uses for this kind in JSON bodies and
+    /// URL paths.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subtask => "subtask",
+            Self::ParentTask => "parenttask",
+            Self::Related => "related",
+            Self::DuplicateOf => "duplicateof",
+            Self::Duplicates => "duplicates",
+            Self::Blocking => "blocking",
+            Self::Blocked => "blocked",
+            Self::Precedes => "precedes",
+            Self::Follows => "follows",
+            Self::CopiedFrom => "copiedfrom",
+            Self::CopiedTo => "copiedto",
+        }
+    }
+}
+
+/// A relation between two tasks (`models.TaskRelation`), as returned by
+/// `PUT /tasks/{taskID}/relations`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskRelation {
+    #[serde(default)]
+    pub task_id: i64,
+    #[serde(default)]
+    pub other_task_id: i64,
+    pub relation_kind: RelationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<User>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
 }
 
 /// Payload for `PUT /projects/{id}/tasks`.
@@ -335,6 +409,124 @@ pub struct Team {
     pub updated: Option<String>,
 }
 
+/// The query stored inside a saved filter (`models.TaskCollection`):
+/// a Vikunja filter expression plus sort order and date semantics.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SavedFilterQuery {
+    /// Vikunja filter expression, e.g. `done = false && priority >= 3`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Fields to sort by, e.g. `["due_date", "id"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_by: Option<Vec<String>>,
+    /// Sort directions matching `sort_by` position by position, e.g.
+    /// `["asc", "desc"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<Vec<String>>,
+    /// IANA timezone used to resolve relative dates like `now/d`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_timezone: Option<String>,
+    /// Whether tasks with a null value in a filtered field match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_include_nulls: Option<bool>,
+}
+
+/// A saved filter (`models.SavedFilter`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SavedFilter {
+    pub id: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    /// The stored query this filter evaluates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<SavedFilterQuery>,
+    #[serde(default)]
+    pub is_favorite: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<User>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+/// Payload for `PUT /filters`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SavedFilterCreate {
+    /// Filter title (required by Vikunja).
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The query to store.
+    pub filters: SavedFilterQuery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_favorite: Option<bool>,
+}
+
+/// Partial update for `POST /filters/{id}`. Fields left as `None` keep
+/// their current value; inside `filters`, individual query fields are
+/// merged onto the stored query the same way.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SavedFilterUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<SavedFilterQuery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_favorite: Option<bool>,
+}
+
+/// Lightweight saved-filter listing entry. Vikunja has no `GET /filters`
+/// endpoint; instead each saved filter appears in the project list as a
+/// pseudo-project with id `-filter_id - 1` (so ids <= -2 are filters).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SavedFilterSummary {
+    /// Numeric id of the saved filter, for use with the filter tools.
+    pub filter_id: i64,
+    /// The negative pseudo-project id Vikunja lists this filter under.
+    pub pseudo_project_id: i64,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub is_favorite: bool,
+}
+
+impl SavedFilterSummary {
+    /// Interprets a project-list entry as a saved filter, if its id is in
+    /// the pseudo-project range.
+    pub fn from_project(project: &Project) -> Option<Self> {
+        let filter_id = saved_filter_id_from_project_id(project.id)?;
+        Some(Self {
+            filter_id,
+            pseudo_project_id: project.id,
+            title: project.title.clone(),
+            description: project.description.clone(),
+            is_favorite: project.is_favorite,
+        })
+    }
+}
+
+/// The pseudo-project id Vikunja uses for a saved filter.
+pub fn saved_filter_pseudo_project_id(filter_id: i64) -> i64 {
+    -filter_id - 1
+}
+
+/// The saved filter id behind a pseudo-project id, if it is one
+/// (ids <= -2; -1 is reserved and positive ids are real projects).
+/// Project ids come from API responses, so `i64::MIN` (whose negation is
+/// not representable) is rejected instead of overflowing.
+pub fn saved_filter_id_from_project_id(project_id: i64) -> Option<i64> {
+    if project_id > -2 {
+        return None;
+    }
+    project_id.checked_neg().map(|negated| negated - 1)
+}
+
 /// Generic `{"message": "..."}` response (`models.Message`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Message {
@@ -410,6 +602,76 @@ mod tests {
     }
 
     #[test]
+    fn relation_kind_serializes_to_vikunja_strings() {
+        let cases: &[(RelationKind, &str)] = &[
+            (RelationKind::Subtask, "subtask"),
+            (RelationKind::ParentTask, "parenttask"),
+            (RelationKind::Related, "related"),
+            (RelationKind::DuplicateOf, "duplicateof"),
+            (RelationKind::Duplicates, "duplicates"),
+            (RelationKind::Blocking, "blocking"),
+            (RelationKind::Blocked, "blocked"),
+            (RelationKind::Precedes, "precedes"),
+            (RelationKind::Follows, "follows"),
+            (RelationKind::CopiedFrom, "copiedfrom"),
+            (RelationKind::CopiedTo, "copiedto"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!(expected),
+                "serializing {kind:?}"
+            );
+            let back: RelationKind = serde_json::from_value(serde_json::json!(expected)).unwrap();
+            assert_eq!(back, *kind, "deserializing {expected}");
+            assert_eq!(kind.as_str(), *expected);
+        }
+    }
+
+    #[test]
+    fn relation_kind_rejects_unknown_values() {
+        for bad in ["unknown", "blocks", "SUBTASK", ""] {
+            assert!(
+                serde_json::from_value::<RelationKind>(serde_json::json!(bad)).is_err(),
+                "{bad:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn task_relation_deserializes_from_api_shape() {
+        let relation: TaskRelation = serde_json::from_value(serde_json::json!({
+            "task_id": 5, "other_task_id": 9, "relation_kind": "precedes",
+            "created_by": {"id": 1, "username": "ada"},
+            "created": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(relation.task_id, 5);
+        assert_eq!(relation.other_task_id, 9);
+        assert_eq!(relation.relation_kind, RelationKind::Precedes);
+    }
+
+    #[test]
+    fn task_related_tasks_default_to_none_and_round_trip() {
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": 1, "title": "t", "project_id": 2
+        }))
+        .unwrap();
+        assert!(task.related_tasks.is_none());
+        // None must stay invisible when serialized (backward compatibility).
+        let value = serde_json::to_value(&task).unwrap();
+        assert!(value.get("related_tasks").is_none());
+
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": 1, "title": "t", "project_id": 2,
+            "related_tasks": {"subtask": [{"id": 4, "title": "child", "project_id": 2}]}
+        }))
+        .unwrap();
+        let related = task.related_tasks.unwrap();
+        assert_eq!(related["subtask"][0].id, 4);
+    }
+
+    #[test]
     fn task_create_omits_unset_fields() {
         let body = TaskCreate {
             title: "New".into(),
@@ -471,6 +733,84 @@ mod tests {
         let team: Team = serde_json::from_value(json).unwrap();
         assert_eq!(team.permission, Some(1));
         assert!(team.members.unwrap()[0].admin);
+    }
+
+    #[test]
+    fn saved_filter_round_trips_and_ignores_unknown_fields() {
+        let json = serde_json::json!({
+            "id": 9, "title": "Open work", "description": "open tasks",
+            "filters": {
+                "sort_by": ["due_date"], "order_by": ["asc"],
+                "filter": "done = false",
+                "filter_timezone": "UTC", "filter_include_nulls": true,
+                "some_future_field": 1
+            },
+            "owner": {"id": 1, "username": "ada"},
+            "is_favorite": true,
+            "created": "2026-01-01T00:00:00Z"
+        });
+        let filter: SavedFilter = serde_json::from_value(json).unwrap();
+        assert_eq!(filter.id, 9);
+        assert!(filter.is_favorite);
+        let query = filter.filters.as_ref().unwrap();
+        assert_eq!(query.filter.as_deref(), Some("done = false"));
+        assert_eq!(query.filter_include_nulls, Some(true));
+        let back: SavedFilter =
+            serde_json::from_value(serde_json::to_value(&filter).unwrap()).unwrap();
+        assert_eq!(back, filter);
+    }
+
+    #[test]
+    fn saved_filter_create_omits_unset_fields() {
+        let body = SavedFilterCreate {
+            title: "Open".into(),
+            filters: SavedFilterQuery {
+                filter: Some("done = false".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"title": "Open", "filters": {"filter": "done = false"}})
+        );
+    }
+
+    #[test]
+    fn saved_filter_pseudo_project_ids_convert_both_ways() {
+        assert_eq!(saved_filter_pseudo_project_id(1), -2);
+        assert_eq!(saved_filter_pseudo_project_id(41), -42);
+        assert_eq!(saved_filter_id_from_project_id(-2), Some(1));
+        assert_eq!(saved_filter_id_from_project_id(-42), Some(41));
+        // Real projects and the reserved -1 id are not filters.
+        assert_eq!(saved_filter_id_from_project_id(7), None);
+        assert_eq!(saved_filter_id_from_project_id(0), None);
+        assert_eq!(saved_filter_id_from_project_id(-1), None);
+        // i64::MIN has no representable negation; a corrupted or malicious
+        // API response must not overflow.
+        assert_eq!(saved_filter_id_from_project_id(i64::MIN), None);
+        assert_eq!(
+            saved_filter_id_from_project_id(i64::MIN + 1),
+            Some(i64::MAX - 1)
+        );
+    }
+
+    #[test]
+    fn saved_filter_summary_derives_only_from_pseudo_projects() {
+        let pseudo: Project = serde_json::from_value(serde_json::json!({
+            "id": -2, "title": "Open work", "description": "d", "is_favorite": true
+        }))
+        .unwrap();
+        let summary = SavedFilterSummary::from_project(&pseudo).unwrap();
+        assert_eq!(summary.filter_id, 1);
+        assert_eq!(summary.pseudo_project_id, -2);
+        assert_eq!(summary.title, "Open work");
+        assert!(summary.is_favorite);
+
+        let real: Project =
+            serde_json::from_value(serde_json::json!({"id": 3, "title": "Inbox"})).unwrap();
+        assert!(SavedFilterSummary::from_project(&real).is_none());
     }
 
     #[test]
