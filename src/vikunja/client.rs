@@ -846,7 +846,8 @@ impl VikunjaClient {
     }
 
     /// Fetches up to `max_pages` pages of tasks and concatenates them,
-    /// discarding the pagination metadata.
+    /// discarding the pagination metadata. At least one page is always
+    /// fetched, even when `max_pages` is 0.
     pub async fn list_all_tasks(&self, max_pages: u32) -> Result<Vec<Task>, Error> {
         let result = self
             .list_all_tasks_with_options(&TaskListOptions::default(), max_pages)
@@ -864,15 +865,12 @@ impl VikunjaClient {
         options: &TaskListOptions,
         max_pages: u32,
     ) -> Result<BoundedTasks, Error> {
+        let mut options = options.clone();
         let mut tasks = Vec::new();
         let mut page = 1u32;
         loop {
-            let result = self
-                .list_tasks(&TaskListOptions {
-                    page: Some(page),
-                    ..options.clone()
-                })
-                .await?;
+            options.page = Some(page);
+            let result = self.list_tasks(&options).await?;
             tasks.extend(result.items);
             let has_more = result.info.has_more == Some(true);
             if !has_more || page >= max_pages {
