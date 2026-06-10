@@ -7,9 +7,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ErrorData as McpError, tool, tool_router};
 use schemars::JsonSchema;
+use schemars::transform::RecursiveTransform;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiErrorKind, Error};
+use crate::schema::strip_unsigned_formats;
 use crate::vikunja::client::TaskListOptions;
 use crate::vikunja::models::{
     Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, Task, TaskAttachment,
@@ -32,6 +34,7 @@ pub const MAX_BULK_TASK_IDS: usize = 100;
 // ----- Shared argument/output shapes ----------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct ProjectsListArgs {
     /// Search projects by title.
     pub search: Option<String>,
@@ -86,6 +89,7 @@ pub struct ProjectsUpdateArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct TasksListArgs {
     /// 1-based page number (default 1).
     pub page: Option<u32>,
@@ -241,6 +245,7 @@ pub struct BulkTaskUserArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct LabelsListArgs {
     /// Search labels by title.
     pub search: Option<String>,
@@ -313,6 +318,7 @@ pub struct CommentIdArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct AttachmentsListArgs {
     /// Numeric id of the task.
     pub task_id: i64,
@@ -366,6 +372,7 @@ pub struct UsersSearchArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct TeamsListArgs {
     /// Search teams by name.
     pub search: Option<String>,
@@ -428,6 +435,7 @@ pub struct OperationResult {
 /// Result of a bulk task operation: aggregate counts plus one entry per
 /// requested task id, in input order.
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct BulkOperationResult {
     /// True only when every task succeeded (`failed == 0`).
     pub ok: bool,
@@ -459,6 +467,7 @@ pub struct BulkTaskResult {
 /// Structured error detail for one failed item of a bulk operation. Carries
 /// the same safe fields as MCP error data — never tokens or headers.
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct BulkItemError {
     /// Error category: `auth`, `forbidden`, `not_found`, `validation`,
     /// `rate_limited`, `server`, `network`, `timeout`, `invalid_response`,
@@ -514,6 +523,7 @@ pub struct UploadResult {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct DownloadResult {
     pub task_id: i64,
     pub attachment_id: i64,

@@ -7,7 +7,10 @@
 //! from request bodies.
 
 use schemars::JsonSchema;
+use schemars::transform::RecursiveTransform;
 use serde::{Deserialize, Serialize};
+
+use crate::schema::strip_unsigned_formats;
 
 /// A Vikunja user (`user.User`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -264,6 +267,7 @@ pub struct TaskComment {
 
 /// Metadata about an uploaded file (`files.File`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
 pub struct FileMeta {
     #[serde(default)]
     pub id: i64,

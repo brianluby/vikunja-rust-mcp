@@ -9,4 +9,5 @@
 pub mod config;
 pub mod error;
 pub mod mcp;
+pub mod schema;
 pub mod vikunja;

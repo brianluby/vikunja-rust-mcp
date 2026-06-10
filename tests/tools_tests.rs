@@ -185,6 +185,54 @@ async fn all_tools_are_registered_with_schemas() {
     client.cancel().await.unwrap();
 }
 
+/// Strict MCP clients log "unknown format ignored" warnings for schemas
+/// using schemars' Rust-specific unsigned formats (`uint`, `uint32`, ...).
+/// Every published input and output schema must be free of them.
+#[tokio::test]
+async fn schemas_contain_no_nonstandard_unsigned_formats() {
+    fn collect_formats(value: &serde_json::Value, found: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::String(format)) = map.get("format") {
+                    found.push(format.clone());
+                }
+                for nested in map.values() {
+                    collect_formats(nested, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for nested in items {
+                    collect_formats(nested, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let client = connect("http://127.0.0.1:1").await;
+    let tools = client.list_all_tools().await.unwrap();
+    assert!(!tools.is_empty());
+
+    for tool in &tools {
+        let mut formats = Vec::new();
+        collect_formats(
+            &serde_json::to_value(&tool.input_schema).unwrap(),
+            &mut formats,
+        );
+        if let Some(output) = &tool.output_schema {
+            collect_formats(&serde_json::to_value(output).unwrap(), &mut formats);
+        }
+        for format in formats {
+            assert!(
+                !format.starts_with("uint"),
+                "tool {} publishes schemars-specific format {format:?}",
+                tool.name
+            );
+        }
+    }
+    client.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn projects_list_returns_structured_page() {
     let server = MockServer::start().await;
