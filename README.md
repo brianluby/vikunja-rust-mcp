@@ -155,6 +155,9 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_task_relations_list` | List a task's relations grouped by kind (subtask, blocking, ...). |
 | `vikunja_task_relations_create` | Relate two tasks (blocking, subtask, precedes, ...). |
 | `vikunja_task_relations_delete` | Remove a relation between two tasks. |
+| `vikunja_task_reminders_list` | List a task's reminders. |
+| `vikunja_task_reminders_add` | Add one reminder (absolute time, date shortcut, or relative to a task date). |
+| `vikunja_task_reminders_set` | Replace all reminders; an empty list clears them. |
 | `vikunja_task_comments_list` | List a task's comments. |
 | `vikunja_task_comments_create` | Comment on a task. |
 | `vikunja_task_comments_update` | Edit a comment. |
@@ -241,6 +244,32 @@ task 9 automatically). Supported kinds: `subtask`, `parenttask`, `related`,
 the kind is validated against this list before any request is sent; creating
 a relation that already exists or naming a missing task surfaces the Vikunja
 error (HTTP status and error code) unchanged.
+
+### Task reminders
+
+Vikunja has no dedicated reminder endpoints: reminders live on the task and
+are written by replacing the task's `reminders` array through the same safe
+read-merge-write update as other task fields. The tools cover the full
+lifecycle: `vikunja_task_reminders_list` reads them,
+`vikunja_task_reminders_add` appends one, and `vikunja_task_reminders_set`
+replaces the list (`"reminders": []` removes every reminder).
+
+Each reminder is either **absolute** or **relative**:
+
+- Absolute: `{"reminder": "2026-07-01T09:00:00Z"}`, or a date shortcut
+  (`{"reminder_shortcut": "next friday"}`) resolved exactly like the task
+  date shortcuts below. The `clear` shortcut is rejected here — clear
+  reminders with `vikunja_task_reminders_set` and an empty list.
+- Relative: `{"relative_to": "due_date", "relative_period_seconds": -3600}`
+  fires one hour before the due date (negative = before, positive = after;
+  anchors: `due_date`, `start_date`, `end_date`). Vikunja computes the
+  absolute time itself and re-computes it when the anchor date moves.
+
+Timezone assumptions: absolute RFC 3339 reminders are passed through to
+Vikunja unchanged, offset included. Reminder shortcuts resolve in the
+**server's local timezone** at `VIKUNJA_DATE_DEFAULT_TIME` (see *Smart date
+shortcuts*). Relative reminders have no timezone of their own — they follow
+the anchor date stored on the task.
 
 ### Smart date shortcuts
 

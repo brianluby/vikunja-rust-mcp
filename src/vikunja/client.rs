@@ -23,13 +23,25 @@ use crate::error::Error;
 use super::models::{
     Bucket, Label, LabelCreate, LabelTask, LabelUpdate, Message, Project, ProjectCreate,
     ProjectUpdate, ProjectView, RelationKind, SavedFilter, SavedFilterCreate, SavedFilterSummary,
-    SavedFilterUpdate, Task, TaskAssignee, TaskComment, TaskCreate, TaskRelation, TaskUpdate, Team,
-    User,
+    SavedFilterUpdate, Task, TaskAssignee, TaskComment, TaskCreate, TaskRelation, TaskReminder,
+    TaskUpdate, Team, User,
 };
 use super::pagination::{BoundedPage, Page, PageInfo, PageParams, walk_pages};
 
 /// How long to wait before the single retry of an idempotent request.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// JSON type name for error messages about unexpected response shapes.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
 
 /// Options for listing tasks via `GET /tasks`.
 #[derive(Debug, Clone, Default)]
@@ -450,6 +462,51 @@ impl VikunjaClient {
             patch,
         )
         .await
+    }
+
+    /// Appends one reminder to a task in a single read-merge-write cycle:
+    /// the list that is extended comes from the same fetch whose body is
+    /// written back, so a reminder added concurrently by someone else is
+    /// never silently dropped (unlike a separate read followed by a
+    /// wholesale replace).
+    pub async fn append_task_reminder(
+        &self,
+        task_id: i64,
+        reminder: &TaskReminder,
+    ) -> Result<Task, Error> {
+        let path = format!("/tasks/{task_id}");
+        let mut current: Value = self.get_json("tasks.get", &path, &[]).await?;
+        let Some(target) = current.as_object_mut() else {
+            return Err(Error::InvalidResponse {
+                endpoint: "tasks.get",
+                detail: "expected a JSON object".to_string(),
+            });
+        };
+        let reminder_value =
+            serde_json::to_value(reminder).map_err(|e| Error::InvalidResponse {
+                endpoint: "task_reminders.add",
+                detail: format!("failed to serialize reminder: {e}"),
+            })?;
+        match target.get_mut("reminders") {
+            Some(Value::Array(reminders)) => reminders.push(reminder_value),
+            None | Some(Value::Null) => {
+                // Absent or `null` (Go's empty-slice serialization).
+                target.insert("reminders".to_string(), Value::Array(vec![reminder_value]));
+            }
+            Some(other) => {
+                // Any other shape is a malformed response; fail fast
+                // instead of overwriting it and writing the task back.
+                return Err(Error::InvalidResponse {
+                    endpoint: "tasks.get",
+                    detail: format!(
+                        "expected reminders to be an array or null, got {}",
+                        json_type_name(other)
+                    ),
+                });
+            }
+        }
+        self.send_json("task_reminders.add", Method::POST, &path, &current)
+            .await
     }
 
     /// Marks a task done or not done (`POST /tasks/{id}` with `done` set).

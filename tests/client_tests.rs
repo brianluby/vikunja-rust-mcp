@@ -11,7 +11,7 @@ use vikunja_rust_mcp::error::{ApiErrorKind, Error};
 use vikunja_rust_mcp::vikunja::client::{TaskListOptions, saved_filter_options};
 use vikunja_rust_mcp::vikunja::models::{
     LabelCreate, LabelUpdate, ProjectCreate, ProjectUpdate, RelationKind, SavedFilter,
-    SavedFilterCreate, SavedFilterQuery, SavedFilterUpdate, TaskCreate, TaskUpdate,
+    SavedFilterCreate, SavedFilterQuery, SavedFilterUpdate, TaskCreate, TaskReminder, TaskUpdate,
 };
 use vikunja_rust_mcp::vikunja::pagination::PageParams;
 use wiremock::matchers::{body_json, body_string_contains, header, method, path, query_param};
@@ -1614,4 +1614,177 @@ async fn task_with_bucket_id_round_trips() {
     let client = test_client(&server.uri());
     let task = client.get_task(11).await.unwrap();
     assert_eq!(task.bucket_id, Some(2));
+}
+
+// ----- task reminders -----------------------------------------------------------
+
+#[tokio::test]
+async fn update_task_replaces_reminders_via_read_merge_write() {
+    let server = MockServer::start().await;
+    // Current task state: a title to preserve and one old reminder.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep me", "done": false, "project_id": 3,
+            "reminders": [{"reminder": "2026-01-01T09:00:00Z"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The write must contain the merged object: kept title, replaced
+    // reminders array (not appended to).
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "Keep me", "done": false, "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-07-01T09:00:00Z"},
+                {"relative_period": -3600, "relative_to": "due_date"}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep me", "done": false, "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-07-01T09:00:00Z"},
+                {"relative_period": -3600, "relative_to": "due_date"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let patch = TaskUpdate {
+        reminders: Some(vec![
+            TaskReminder {
+                reminder: Some("2026-07-01T09:00:00Z".into()),
+                relative_period: None,
+                relative_to: None,
+            },
+            TaskReminder {
+                reminder: None,
+                relative_period: Some(-3600),
+                relative_to: Some("due_date".into()),
+            },
+        ]),
+        ..Default::default()
+    };
+    let task = client.update_task(9, &patch).await.unwrap();
+    assert_eq!(task.reminders.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn append_task_reminder_uses_single_fetch_and_preserves_unknown_fields() {
+    let server = MockServer::start().await;
+    // Exactly one GET: the appended-to list and the merged write body must
+    // come from the same fetch. The unknown field must survive the write.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3,
+            "some_future_field": {"keep": true},
+            "reminders": [{"reminder": "2026-01-01T09:00:00Z"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3,
+            "some_future_field": {"keep": true},
+            "reminders": [
+                {"reminder": "2026-01-01T09:00:00Z"},
+                {"reminder": "2026-07-01T09:00:00Z"}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "Keep", "done": false, "project_id": 3,
+            "reminders": [
+                {"reminder": "2026-01-01T09:00:00Z"},
+                {"reminder": "2026-07-01T09:00:00Z"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let reminder = TaskReminder {
+        reminder: Some("2026-07-01T09:00:00Z".into()),
+        relative_period: None,
+        relative_to: None,
+    };
+    let task = client.append_task_reminder(9, &reminder).await.unwrap();
+    assert_eq!(task.reminders.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn append_task_reminder_starts_list_when_absent() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .and(body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": [{"reminder": "2026-07-01T09:00:00Z"}]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": [{"reminder": "2026-07-01T09:00:00Z"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let reminder = TaskReminder {
+        reminder: Some("2026-07-01T09:00:00Z".into()),
+        relative_period: None,
+        relative_to: None,
+    };
+    let task = client.append_task_reminder(9, &reminder).await.unwrap();
+    assert_eq!(task.reminders.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn append_task_reminder_rejects_malformed_reminders_shape() {
+    let server = MockServer::start().await;
+    // A non-array, non-null `reminders` must fail fast instead of being
+    // silently overwritten and written back.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "title": "t", "done": false, "project_id": 3,
+            "reminders": {"unexpected": "object"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/tasks/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let reminder = TaskReminder {
+        reminder: Some("2026-07-01T09:00:00Z".into()),
+        relative_period: None,
+        relative_to: None,
+    };
+    let err = client.append_task_reminder(9, &reminder).await.unwrap_err();
+    let Error::InvalidResponse { detail, .. } = err else {
+        panic!("expected InvalidResponse, got {err:?}");
+    };
+    assert!(detail.contains("reminders"));
 }

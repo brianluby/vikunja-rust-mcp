@@ -194,6 +194,9 @@ pub struct Task {
     /// Vikunja server do not break deserialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub related_tasks: Option<BTreeMap<String, Vec<Task>>>,
+    /// Reminders attached to the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminders: Option<Vec<TaskReminder>>,
     /// Id of the Kanban bucket the task sits in, when the API reports it.
     /// Resolve bucket names with the bucket listing for the project's
     /// kanban view. Absent (and omitted from output) when Vikunja does not
@@ -281,6 +284,27 @@ where
 {
     let id = Option::<i64>::deserialize(deserializer)?;
     Ok(id.filter(|id| *id > 0))
+}
+
+/// A task reminder (`models.TaskReminder`): either an absolute `reminder`
+/// timestamp, or a period relative to one of the task's dates — Vikunja
+/// then computes (and recomputes) the absolute time itself. Reminders have
+/// no dedicated endpoints; they are read from the task and written by
+/// replacing the task's `reminders` array on update.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskReminder {
+    /// Absolute reminder time as RFC 3339. Filled in by the server for
+    /// relative reminders once the anchor date exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<String>,
+    /// Offset in seconds from `relative_to`; negative means before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_period: Option<i64>,
+    /// Task date the period is relative to: `due_date`, `start_date` or
+    /// `end_date`. Kept as a string on read so future anchors do not break
+    /// deserialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_to: Option<String>,
 }
 
 /// Kind of a relation between two tasks (`models.RelationKind`). Vikunja's
@@ -410,6 +434,10 @@ pub struct TaskUpdate {
     pub is_favorite: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat_after: Option<i64>,
+    /// Replaces the task's reminder list wholesale; an empty list clears
+    /// all reminders. `None` leaves reminders untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminders: Option<Vec<TaskReminder>>,
 }
 
 /// A task comment (`models.TaskComment`).
@@ -686,6 +714,92 @@ mod tests {
         assert_eq!(task.labels.as_ref().unwrap()[0].title, "urgent");
         assert_eq!(task.assignees.as_ref().unwrap()[0].username, "ada");
         assert_eq!(task.identifier, "DOCS-7");
+    }
+
+    #[test]
+    fn task_reminder_serde_round_trip() {
+        // Absolute reminder: only the timestamp is on the wire.
+        let absolute = TaskReminder {
+            reminder: Some("2026-07-01T09:00:00Z".into()),
+            relative_period: None,
+            relative_to: None,
+        };
+        let value = serde_json::to_value(&absolute).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"reminder": "2026-07-01T09:00:00Z"})
+        );
+        let back: TaskReminder = serde_json::from_value(value).unwrap();
+        assert_eq!(back, absolute);
+
+        // Relative reminder: one hour before the due date.
+        let relative: TaskReminder = serde_json::from_value(serde_json::json!({
+            "reminder": "2026-06-30T08:00:00Z",
+            "relative_period": -3600,
+            "relative_to": "due_date"
+        }))
+        .unwrap();
+        assert_eq!(relative.relative_period, Some(-3600));
+        assert_eq!(relative.relative_to.as_deref(), Some("due_date"));
+    }
+
+    #[test]
+    fn task_parses_reminders_and_defaults_to_none() {
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": 1, "title": "t", "project_id": 2
+        }))
+        .unwrap();
+        assert!(task.reminders.is_none());
+        // None must stay invisible when serialized (backward compatibility).
+        let value = serde_json::to_value(&task).unwrap();
+        assert!(value.get("reminders").is_none());
+
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": 1, "title": "t", "project_id": 2,
+            "reminders": [
+                {"reminder": "2026-07-01T09:00:00Z"},
+                {"relative_period": -600, "relative_to": "start_date"}
+            ]
+        }))
+        .unwrap();
+        let reminders = task.reminders.unwrap();
+        assert_eq!(reminders.len(), 2);
+        assert_eq!(
+            reminders[0].reminder.as_deref(),
+            Some("2026-07-01T09:00:00Z")
+        );
+        assert_eq!(reminders[1].relative_period, Some(-600));
+    }
+
+    #[test]
+    fn task_update_reminders_serialization() {
+        // Omitted: the merge must not touch reminders.
+        let patch = TaskUpdate::default();
+        let value = serde_json::to_value(&patch).unwrap();
+        assert!(value.get("reminders").is_none());
+
+        // Empty list: explicit clear.
+        let patch = TaskUpdate {
+            reminders: Some(vec![]),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(value["reminders"], serde_json::json!([]));
+
+        // Replacement list.
+        let patch = TaskUpdate {
+            reminders: Some(vec![TaskReminder {
+                reminder: Some("2026-07-01T09:00:00Z".into()),
+                relative_period: None,
+                relative_to: None,
+            }]),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            value["reminders"],
+            serde_json::json!([{"reminder": "2026-07-01T09:00:00Z"}])
+        );
     }
 
     #[test]
