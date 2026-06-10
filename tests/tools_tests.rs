@@ -3359,3 +3359,195 @@ async fn one_page_lists_omit_auto_pagination_metadata() {
     );
     client.cancel().await.unwrap();
 }
+
+// ----- attachment path sandboxing through the tool layer -----------------------
+
+/// Boots the MCP server with an attachment sandbox and connects a client.
+async fn connect_sandboxed(
+    vikunja_url: &str,
+    upload_roots: &[&std::path::Path],
+    download_roots: &[&std::path::Path],
+) -> McpClient {
+    let sandbox = vikunja_rust_mcp::sandbox::AttachmentSandbox::new(
+        &upload_roots
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>(),
+        &download_roots
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>(),
+    )
+    .expect("test sandbox roots should validate");
+    let server = vikunja_rust_mcp::mcp::VikunjaMcpServer::new(test_client(vikunja_url))
+        .with_attachment_sandbox(sandbox);
+    let (server_io, client_io) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        if let Ok(service) = rmcp::serve_server(server, server_io).await {
+            let _ = service.waiting().await;
+        }
+    });
+    ().serve(client_io).await.expect("client should connect")
+}
+
+#[tokio::test]
+async fn sandboxed_upload_rejects_file_path_outside_root() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let file = outside.path().join("secret.txt");
+    std::fs::write(&file, b"data").unwrap();
+
+    // Unreachable Vikunja URL: rejection must happen before any request.
+    let client = connect_sandboxed("http://127.0.0.1:1", &[root.path()], &[]).await;
+    let err = call(
+        &client,
+        "vikunja_task_attachments_upload",
+        json!({"task_id": 9, "file_path": file.to_str().unwrap()}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(data.message.contains("upload"), "{}", data.message);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn sandboxed_upload_accepts_file_inside_root() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/tasks/9/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"message": "uploaded"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("report.txt");
+    std::fs::write(&file, b"file body").unwrap();
+
+    let client = connect_sandboxed(&server.uri(), &[root.path()], &[]).await;
+    let result = call(
+        &client,
+        "vikunja_task_attachments_upload",
+        json!({"task_id": 9, "file_path": file.to_str().unwrap()}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured(&result)["ok"], true);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn sandboxed_download_rejects_save_path_outside_root() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+
+    let client = connect_sandboxed("http://127.0.0.1:1", &[], &[root.path()]).await;
+    let err = call(
+        &client,
+        "vikunja_task_attachments_download",
+        json!({
+            "task_id": 9, "attachment_id": 4,
+            "save_path": outside.path().join("out.bin").to_str().unwrap()
+        }),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(data.message.contains("download"), "{}", data.message);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn sandboxed_download_writes_inside_root() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9/attachments/4"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"saved bytes".to_vec()))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let save_path = root.path().join("out.bin");
+    let resolved = root.path().canonicalize().unwrap().join("out.bin");
+
+    let client = connect_sandboxed(&server.uri(), &[], &[root.path()]).await;
+    let result = call(
+        &client,
+        "vikunja_task_attachments_download",
+        json!({
+            "task_id": 9, "attachment_id": 4,
+            "save_path": save_path.to_str().unwrap()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let body = structured(&result);
+    // saved_to reports the canonicalized location actually written.
+    assert_eq!(body["saved_to"], resolved.to_str().unwrap());
+    assert_eq!(std::fs::read(&resolved).unwrap(), b"saved bytes");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn sandbox_leaves_base64_and_inline_flows_unaffected() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/tasks/9/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"message": "uploaded"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks/9/attachments/4"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"inline bytes".to_vec()))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let client = connect_sandboxed(&server.uri(), &[root.path()], &[root.path()]).await;
+
+    // Base64 upload carries no file_path: the sandbox must not interfere.
+    let upload = call(
+        &client,
+        "vikunja_task_attachments_upload",
+        json!({
+            "task_id": 9,
+            "file_name": "note.txt",
+            "content_base64": BASE64.encode(b"hello")
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured(&upload)["ok"], true);
+
+    // Inline download carries no save_path: also unaffected.
+    let download = call(
+        &client,
+        "vikunja_task_attachments_download",
+        json!({"task_id": 9, "attachment_id": 4}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        structured(&download)["content_base64"],
+        BASE64.encode(b"inline bytes")
+    );
+    client.cancel().await.unwrap();
+}

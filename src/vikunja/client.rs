@@ -788,19 +788,21 @@ impl VikunjaClient {
         &self,
         task_id: i64,
         attachment_id: i64,
-        path: &str,
+        path: impl AsRef<std::path::Path>,
     ) -> Result<(u64, Option<String>), Error> {
         use tokio::io::AsyncWriteExt;
 
         let endpoint = "attachments.download";
-        debug!(endpoint, task_id, attachment_id, path, "download to file");
+        let path = path.as_ref();
+        let shown = path.display();
+        debug!(endpoint, task_id, attachment_id, %shown, "download to file");
         let builder = self
             .http
             .get(self.api_url(&format!("/tasks/{task_id}/attachments/{attachment_id}")));
         let mut response = self.execute(endpoint, builder, true).await?;
         let content_type = extract_content_type(&response);
         let mut file = tokio::fs::File::create(path).await.map_err(|e| Error::Io {
-            detail: format!("could not create {path}: {e}"),
+            detail: format!("could not create {shown}: {e}"),
         })?;
         let mut written: u64 = 0;
         while let Some(chunk) = response
@@ -809,12 +811,12 @@ impl VikunjaClient {
             .map_err(|e| Error::from_reqwest(endpoint, e))?
         {
             file.write_all(&chunk).await.map_err(|e| Error::Io {
-                detail: format!("could not write {path}: {e}"),
+                detail: format!("could not write {shown}: {e}"),
             })?;
             written += chunk.len() as u64;
         }
         file.flush().await.map_err(|e| Error::Io {
-            detail: format!("could not write {path}: {e}"),
+            detail: format!("could not write {shown}: {e}"),
         })?;
         Ok((written, content_type))
     }
