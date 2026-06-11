@@ -31,6 +31,20 @@ pub enum ApiErrorKind {
 }
 
 impl ApiErrorKind {
+    /// Fixed, low-cardinality label for metrics and structured logs.
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::Validation => "validation",
+            Self::Conflict => "conflict",
+            Self::RateLimited => "rate_limited",
+            Self::Server => "server",
+            Self::Other => "other",
+        }
+    }
+
     pub fn from_status(status: u16) -> Self {
         match status {
             401 => Self::Auth,
@@ -98,6 +112,20 @@ pub enum Error {
 }
 
 impl Error {
+    /// Fixed, low-cardinality error-class label for metrics and structured
+    /// logs. Never contains user input, tokens or messages.
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            Self::Api { kind, .. } => kind.metric_label(),
+            Self::Network { .. } => "network",
+            Self::Timeout { .. } => "timeout",
+            Self::InvalidResponse { .. } => "invalid_response",
+            Self::Io { .. } => "io",
+            Self::TooLarge { .. } => "too_large",
+            Self::InvalidArgument(_) => "invalid_argument",
+        }
+    }
+
     /// Builds an [`Error`] from a transport-level `reqwest` failure.
     /// The resulting message contains no headers and therefore no token.
     pub fn from_reqwest(endpoint: &'static str, err: reqwest::Error) -> Self {
@@ -271,6 +299,62 @@ mod tests {
         assert_eq!(ApiErrorKind::from_status(500), ApiErrorKind::Server);
         assert_eq!(ApiErrorKind::from_status(503), ApiErrorKind::Server);
         assert_eq!(ApiErrorKind::from_status(418), ApiErrorKind::Other);
+    }
+
+    #[test]
+    fn metric_labels_are_fixed_and_secret_free() {
+        for (kind, label) in [
+            (ApiErrorKind::Auth, "auth"),
+            (ApiErrorKind::Forbidden, "forbidden"),
+            (ApiErrorKind::NotFound, "not_found"),
+            (ApiErrorKind::Validation, "validation"),
+            (ApiErrorKind::Conflict, "conflict"),
+            (ApiErrorKind::RateLimited, "rate_limited"),
+            (ApiErrorKind::Server, "server"),
+            (ApiErrorKind::Other, "other"),
+        ] {
+            assert_eq!(kind.metric_label(), label);
+        }
+
+        let api = Error::from_status("tasks.get", 500, b"tk_secret should not surface");
+        assert_eq!(api.metric_label(), "server");
+        assert_eq!(
+            Error::Timeout {
+                endpoint: "tasks.get"
+            }
+            .metric_label(),
+            "timeout"
+        );
+        assert_eq!(
+            Error::Network {
+                endpoint: "tasks.get",
+                detail: "x".into()
+            }
+            .metric_label(),
+            "network"
+        );
+        assert_eq!(
+            Error::InvalidResponse {
+                endpoint: "tasks.get",
+                detail: "x".into()
+            }
+            .metric_label(),
+            "invalid_response"
+        );
+        assert_eq!(Error::Io { detail: "x".into() }.metric_label(), "io");
+        assert_eq!(
+            Error::TooLarge {
+                endpoint: "tasks.get",
+                size: None,
+                limit: 1
+            }
+            .metric_label(),
+            "too_large"
+        );
+        assert_eq!(
+            Error::InvalidArgument("x".into()).metric_label(),
+            "invalid_argument"
+        );
     }
 
     #[test]

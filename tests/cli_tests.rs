@@ -15,6 +15,7 @@ fn binary() -> Command {
         .env_remove("MCP_HTTP_ALLOWED_HOSTS")
         .env_remove("MCP_HTTP_AUTH_TOKEN")
         .env_remove("MCP_HTTP_ALLOW_UNAUTHENTICATED")
+        .env_remove("MCP_HTTP_ENABLE_METRICS")
         .env_remove("VIKUNJA_TIMEOUT_SECS")
         .env_remove("VIKUNJA_DEFAULT_PAGE_SIZE");
     cmd
@@ -52,9 +53,11 @@ fn help_lists_options() {
         "--api-token",
         "--bind",
         "--http-auth-token",
+        "--http-enable-metrics",
         "VIKUNJA_URL",
         "VIKUNJA_API_TOKEN",
         "MCP_HTTP_AUTH_TOKEN",
+        "MCP_HTTP_ENABLE_METRICS",
     ] {
         assert!(stdout.contains(needle), "--help should mention {needle}");
     }
@@ -218,6 +221,14 @@ fn http_transport_serves_mcp() {
     }
     assert!(healthy, "server did not become healthy at {health_url}");
 
+    // /metrics is disabled by default.
+    let metrics = ureq_get(&format!("http://{addr}/metrics")).expect("GET /metrics");
+    assert!(metrics.contains("404"), "expected 404, got: {metrics}");
+
+    // /readyz exists and reports the unreachable instance as not ready.
+    let readyz = ureq_get(&format!("http://{addr}/readyz")).expect("GET /readyz");
+    assert!(readyz.contains("503"), "expected 503, got: {readyz}");
+
     // POST an initialize request to /mcp.
     let initialize = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -328,6 +339,101 @@ fn http_transport_enforces_bearer_auth() {
         .status();
     let status = wait_for_exit(&mut server.0);
     assert!(status.is_some(), "server did not exit after SIGINT");
+}
+
+/// Enabling metrics with the stdio transport is an invalid combination and
+/// must fail fast at startup.
+#[test]
+fn stdio_transport_rejects_metrics_flag() {
+    let output = binary()
+        .args([
+            "--vikunja-url",
+            "https://example.com",
+            "--api-token",
+            "t",
+            "--http-enable-metrics",
+        ])
+        .output()
+        .expect("run binary");
+    assert!(!output.status.success(), "server should refuse to start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--transport http"), "stderr was: {stderr}");
+}
+
+/// With --http-enable-metrics, /metrics serves Prometheus text, /readyz
+/// reports the (unreachable) Vikunja instance as not ready, and neither the
+/// endpoints nor the logs leak the API token.
+#[test]
+fn http_transport_serves_readyz_and_metrics_when_enabled() {
+    let token = "tk_cli_metrics_secret";
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    let child = binary()
+        .args([
+            "--transport",
+            "http",
+            "--bind",
+            &addr.to_string(),
+            "--vikunja-url",
+            "http://127.0.0.1:1",
+            "--api-token",
+            token,
+            "--http-enable-metrics",
+        ])
+        .env("RUST_LOG", "debug")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+    let mut server = KillOnDrop(child);
+    let mut stderr = server.0.stderr.take().expect("stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
+
+    let health_url = format!("http://{addr}/healthz");
+    let mut healthy = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(response) = ureq_get(&health_url)
+            && response.contains("ok")
+        {
+            healthy = true;
+            break;
+        }
+    }
+    assert!(healthy, "server did not become healthy at {health_url}");
+
+    // Readiness: the configured Vikunja instance is unreachable.
+    let readyz = ureq_get(&format!("http://{addr}/readyz")).expect("GET /readyz");
+    assert!(readyz.contains("503"), "expected 503, got: {readyz}");
+    assert!(readyz.contains("not ready"), "body was: {readyz}");
+    assert!(!readyz.contains(token), "token leaked: {readyz}");
+
+    // Metrics: Prometheus text with low-cardinality names, no secrets.
+    let metrics = ureq_get(&format!("http://{addr}/metrics")).expect("GET /metrics");
+    assert!(metrics.contains("200"), "expected 200, got: {metrics}");
+    assert!(
+        metrics.contains("vikunja_mcp_http_requests_total"),
+        "metrics were: {metrics}"
+    );
+    assert!(!metrics.contains(token), "token leaked: {metrics}");
+
+    let pid = server.0.id();
+    let _ = Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status();
+    let status = wait_for_exit(&mut server.0);
+    assert!(status.is_some(), "server did not exit after SIGINT");
+
+    // Structured logs on stderr must never contain the API token.
+    let logs = stderr_reader.join().expect("join stderr reader");
+    assert!(!logs.contains(token), "token leaked in logs: {logs}");
 }
 
 /// Binding beyond loopback without authentication must refuse to start
