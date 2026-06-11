@@ -130,7 +130,9 @@ when configured, live only in GitHub Actions secrets.
 
 Version tags also publish Docker images to
 `ghcr.io/brianluby/vikunja-rust-mcp` — see the [Docker](#docker) install
-section above.
+section above. Images are cosign-signed by digest (keyless, GitHub OIDC) and
+carry registry-pushed build provenance attestations; images built for pushes
+to `main` are signed the same way.
 
 ### Verifying a download
 
@@ -156,6 +158,20 @@ Build provenance (requires the [gh](https://cli.github.com/) CLI):
 
 ```bash
 gh attestation verify vikunja-rust-mcp-macos-aarch64.tar.gz \
+  --repo brianluby/vikunja-rust-mcp \
+  --signer-workflow brianluby/vikunja-rust-mcp/.github/workflows/build.yml
+```
+
+Docker images (signature and provenance are attached to the image digest, so
+verifying a tag verifies the exact image it currently points at):
+
+```bash
+cosign verify ghcr.io/brianluby/vikunja-rust-mcp:0.3.0 \
+  --certificate-identity-regexp \
+    'https://github.com/brianluby/vikunja-rust-mcp/\.github/workflows/build\.yml@refs/(heads/main|tags/v.*)' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+gh attestation verify oci://ghcr.io/brianluby/vikunja-rust-mcp:0.3.0 \
   --repo brianluby/vikunja-rust-mcp \
   --signer-workflow brianluby/vikunja-rust-mcp/.github/workflows/build.yml
 ```
