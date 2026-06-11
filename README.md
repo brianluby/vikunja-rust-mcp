@@ -15,13 +15,87 @@ tools.
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024) to build.
+- Rust 1.88+ (edition 2024) to build (only when building from source; the
+  locked dependency graph requires 1.88).
 - A Vikunja instance (1.0 or later) and an **API token**: in Vikunja go to
   *Settings → API Tokens* and create a token with the scopes you want this
   server to use (projects, tasks, labels, task comments, attachments, users,
   teams). Operations whose scope is missing fail with a clear `403` error.
 
-## Build
+## Install
+
+### Prebuilt binaries
+
+Tagged releases publish Linux, macOS and Windows packages. Replace `0.3.0`
+with the version you want:
+
+```bash
+VERSION=0.3.0
+curl -L -o vikunja-rust-mcp.tar.gz \
+  "https://github.com/brianluby/vikunja-rust-mcp/releases/download/v${VERSION}/vikunja-rust-mcp-linux-x86_64.tar.gz"
+curl -L -O \
+  "https://github.com/brianluby/vikunja-rust-mcp/releases/download/v${VERSION}/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf vikunja-rust-mcp.tar.gz
+install -m 0755 vikunja-rust-mcp ~/.local/bin/vikunja-rust-mcp
+```
+
+Use `vikunja-rust-mcp-macos-aarch64.tar.gz` on Apple Silicon macOS and
+`vikunja-rust-mcp-windows-x86_64.zip` on Windows.
+
+### Docker
+
+Images are published to GitHub Container Registry as
+`ghcr.io/brianluby/vikunja-rust-mcp:<version>`. The runtime image uses a
+distroless nonroot base and carries OCI labels
+(`org.opencontainers.image.source`, `.description`, `.licenses`,
+`.version`) identifying its source repository and release.
+
+Run stdio mode for local MCP clients:
+
+```bash
+docker run --rm -i \
+  -e VIKUNJA_URL=https://try.vikunja.io \
+  -e VIKUNJA_API_TOKEN=tk_... \
+  ghcr.io/brianluby/vikunja-rust-mcp:0.3.0
+```
+
+Run HTTP mode locally:
+
+```bash
+docker run --rm \
+  -p 127.0.0.1:8077:8077 \
+  -e VIKUNJA_URL=https://try.vikunja.io \
+  -e VIKUNJA_API_TOKEN=tk_... \
+  -e MCP_TRANSPORT=http \
+  -e MCP_HTTP_BIND=0.0.0.0:8077 \
+  -e MCP_HTTP_AUTH_TOKEN=$(openssl rand -hex 32) \
+  ghcr.io/brianluby/vikunja-rust-mcp:0.3.0
+```
+
+The liveness endpoint is `http://127.0.0.1:8077/healthz`; the MCP endpoint is
+`http://127.0.0.1:8077/mcp` and requires the bearer token above.
+
+For a reverse-proxy deployment, bind inside the container and allow the public
+hostname clients will use:
+
+```bash
+docker run -d --name vikunja-rust-mcp \
+  --restart unless-stopped \
+  -p 127.0.0.1:8077:8077 \
+  -e VIKUNJA_URL=https://vikunja.example.com \
+  -e VIKUNJA_API_TOKEN=tk_... \
+  -e MCP_TRANSPORT=http \
+  -e MCP_HTTP_BIND=0.0.0.0:8077 \
+  -e MCP_HTTP_ALLOWED_HOSTS=mcp.example.com \
+  -e MCP_HTTP_AUTH_TOKEN=change-me-to-a-long-random-token \
+  ghcr.io/brianluby/vikunja-rust-mcp:0.3.0
+```
+
+Terminate TLS at the reverse proxy and forward `/mcp` and `/healthz` to
+`127.0.0.1:8077`.
+
+## Build From Source
 
 ```bash
 cargo build --release
@@ -31,9 +105,10 @@ cargo build --release
 ## Release Artifacts
 
 Tagged releases publish platform packages for Linux, macOS and Windows. Each
-release also includes `vikunja-rust-mcp-sbom.cdx.json`, a CycloneDX 1.5 SBOM
-generated from the locked Cargo dependency graph with all features and targets
-included.
+release also includes `SHA256SUMS` and `vikunja-rust-mcp-sbom.cdx.json`, a
+CycloneDX 1.5 SBOM generated from the locked Cargo dependency graph with all
+features and targets included. Version tags also publish Docker images to
+`ghcr.io/brianluby/vikunja-rust-mcp`.
 
 ## Configuration
 
