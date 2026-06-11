@@ -147,6 +147,9 @@ jobs:
   docker:
     name: Build Docker image
     needs: build
+    # PRs: build but never push (login and push are both gated on != pull_request).
+    # Pushes to main and v* tags: build and push. workflow_dispatch on a feature
+    # branch is intentionally skipped so no branch-named tags reach GHCR.
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -186,7 +189,7 @@ jobs:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
+            VERSION=${{ steps.meta.outputs.version || 'dev' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -194,9 +197,9 @@ jobs:
 
   release:
     name: Publish release packages
-    needs:
-      - build
-      - docker
+    # Deliberately independent of the docker job: a transient registry or
+    # BuildKit failure must not block publishing the binary archives and SBOM.
+    needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

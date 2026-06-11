@@ -40,8 +40,10 @@ tar -xzf vikunja-rust-mcp.tar.gz
 install -m 0755 vikunja-rust-mcp ~/.local/bin/vikunja-rust-mcp
 ```
 
-Use `vikunja-rust-mcp-macos-aarch64.tar.gz` on Apple Silicon macOS and
-`vikunja-rust-mcp-windows-x86_64.zip` on Windows.
+Use `vikunja-rust-mcp-macos-aarch64.tar.gz` on Apple Silicon macOS
+(replace `sha256sum -c SHA256SUMS --ignore-missing` with
+`shasum -a 256 -c SHA256SUMS --ignore-missing` — macOS has no GNU
+`sha256sum`) and `vikunja-rust-mcp-windows-x86_64.zip` on Windows.
 
 ### Docker
 
