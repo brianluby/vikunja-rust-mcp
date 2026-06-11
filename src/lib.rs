@@ -10,6 +10,7 @@ pub mod config;
 pub mod dates;
 pub mod error;
 pub mod mcp;
+pub mod metrics;
 pub mod sandbox;
 pub mod schema;
 pub mod vikunja;
