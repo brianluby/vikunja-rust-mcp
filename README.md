@@ -26,11 +26,11 @@ tools.
 
 ### Prebuilt binaries
 
-Tagged releases publish Linux, macOS and Windows packages. Replace `0.3.0`
+Tagged releases publish Linux, macOS and Windows packages. Replace `1.0.0`
 with the version you want:
 
 ```bash
-VERSION=0.3.0
+VERSION=1.0.0
 curl -L -o vikunja-rust-mcp.tar.gz \
   "https://github.com/brianluby/vikunja-rust-mcp/releases/download/v${VERSION}/vikunja-rust-mcp-linux-x86_64.tar.gz"
 curl -L -O \
@@ -63,7 +63,7 @@ Run stdio mode for local MCP clients:
 docker run --rm -i \
   -e VIKUNJA_URL=https://try.vikunja.io \
   -e VIKUNJA_API_TOKEN=tk_... \
-  ghcr.io/brianluby/vikunja-rust-mcp:0.3.0
+  ghcr.io/brianluby/vikunja-rust-mcp:1.0.0
 ```
 
 Run HTTP mode locally:
@@ -76,7 +76,7 @@ docker run --rm \
   -e MCP_TRANSPORT=http \
   -e MCP_HTTP_BIND=0.0.0.0:8077 \
   -e MCP_HTTP_AUTH_TOKEN=$(openssl rand -hex 32) \
-  ghcr.io/brianluby/vikunja-rust-mcp:0.3.0
+  ghcr.io/brianluby/vikunja-rust-mcp:1.0.0
 ```
 
 The liveness endpoint is `http://127.0.0.1:8077/healthz`; the MCP endpoint is
@@ -95,7 +95,7 @@ docker run -d --name vikunja-rust-mcp \
   -e MCP_HTTP_BIND=0.0.0.0:8077 \
   -e MCP_HTTP_ALLOWED_HOSTS=mcp.example.com \
   -e MCP_HTTP_AUTH_TOKEN=change-me-to-a-long-random-token \
-  ghcr.io/brianluby/vikunja-rust-mcp:0.3.0
+  ghcr.io/brianluby/vikunja-rust-mcp:1.0.0
 ```
 
 Terminate TLS at the reverse proxy and forward `/mcp` and `/healthz` to
@@ -166,12 +166,12 @@ Docker images (signature and provenance are attached to the image digest, so
 verifying a tag verifies the exact image it currently points at):
 
 ```bash
-cosign verify ghcr.io/brianluby/vikunja-rust-mcp:0.3.0 \
+cosign verify ghcr.io/brianluby/vikunja-rust-mcp:1.0.0 \
   --certificate-identity-regexp \
     'https://github.com/brianluby/vikunja-rust-mcp/\.github/workflows/build\.yml@refs/(heads/main|tags/v.*)' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-gh attestation verify oci://ghcr.io/brianluby/vikunja-rust-mcp:0.3.0 \
+gh attestation verify oci://ghcr.io/brianluby/vikunja-rust-mcp:1.0.0 \
   --repo brianluby/vikunja-rust-mcp \
   --signer-workflow brianluby/vikunja-rust-mcp/.github/workflows/build.yml
 ```
