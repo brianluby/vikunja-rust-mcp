@@ -524,6 +524,90 @@ pub struct Team {
     pub updated: Option<String>,
 }
 
+/// A user with access to a project (`models.UserWithPermission`): user
+/// fields plus the user's `permission` on that project (0 read, 1 write,
+/// 2 admin).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UserWithPermission {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// The user's permission on the project: 0 read, 1 write, 2 admin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+/// A project <-> user share relation (`models.ProjectUser`), as returned by
+/// the project user grant/update endpoints. `id` is the id of the share
+/// relation, not of the user; the user is identified by `username`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectUserShare {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub username: String,
+    /// The user's permission on the project: 0 read, 1 write, 2 admin.
+    #[serde(default)]
+    pub permission: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+/// Payload of `PUT /projects/{id}/users`: Vikunja identifies the user to
+/// add by their unique username, never by numeric id.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectUserShareCreate {
+    pub username: String,
+    /// Permission to grant: 0 read, 1 write, 2 admin.
+    pub permission: i64,
+}
+
+/// A project <-> team share relation (`models.TeamProject`), as returned by
+/// the project team grant/update endpoints. `id` is the id of the share
+/// relation, not of the team.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectTeamShare {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub team_id: i64,
+    /// The team's permission on the project: 0 read, 1 write, 2 admin.
+    #[serde(default)]
+    pub permission: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+}
+
+/// Payload of `PUT /projects/{id}/teams`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectTeamShareCreate {
+    pub team_id: i64,
+    /// Permission to grant: 0 read, 1 write, 2 admin.
+    pub permission: i64,
+}
+
+/// Payload of the share update endpoints
+/// (`POST /projects/{id}/users/{userID}` and
+/// `POST /projects/{id}/teams/{teamID}`): only the permission can change.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectShareUpdate {
+    /// New permission level: 0 read, 1 write, 2 admin.
+    pub permission: i64,
+}
+
 /// The query stored inside a saved filter (`models.TaskCollection`):
 /// a Vikunja filter expression plus sort order and date semantics.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -10,8 +10,9 @@ use serde_json::json;
 use vikunja_rust_mcp::error::{ApiErrorKind, Error};
 use vikunja_rust_mcp::vikunja::client::{TaskListOptions, saved_filter_options};
 use vikunja_rust_mcp::vikunja::models::{
-    LabelCreate, LabelUpdate, ProjectCreate, ProjectUpdate, RelationKind, SavedFilter,
-    SavedFilterCreate, SavedFilterQuery, SavedFilterUpdate, TaskCreate, TaskReminder, TaskUpdate,
+    LabelCreate, LabelUpdate, ProjectCreate, ProjectShareUpdate, ProjectTeamShareCreate,
+    ProjectUpdate, ProjectUserShareCreate, RelationKind, SavedFilter, SavedFilterCreate,
+    SavedFilterQuery, SavedFilterUpdate, TaskCreate, TaskReminder, TaskUpdate,
 };
 use vikunja_rust_mcp::vikunja::pagination::PageParams;
 use wiremock::matchers::{body_json, body_string_contains, header, method, path, query_param};
@@ -864,6 +865,240 @@ async fn teams_list_and_project_teams() {
         .unwrap();
     assert_eq!(project_teams.items[0].permission, Some(2));
     assert!(project_teams.items[0].members.as_ref().unwrap()[0].admin);
+}
+
+// ----- project sharing -----------------------------------------------------------------
+
+#[tokio::test]
+async fn project_users_list_sends_query_and_reads_permissions() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/users"))
+        .and(query_param("s", "ada"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([
+                    {"id": 3, "username": "ada", "name": "Ada Lovelace",
+                     "email": "ada@example.com", "permission": 2}
+                ]))
+                .insert_header("x-pagination-total-pages", "1")
+                .insert_header("x-pagination-result-count", "1"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let users = client
+        .list_project_users(7, PageParams::default(), Some("ada"))
+        .await
+        .unwrap();
+    assert_eq!(users.items.len(), 1);
+    assert_eq!(users.items[0].id, 3);
+    assert_eq!(users.items[0].username, "ada");
+    assert_eq!(users.items[0].permission, Some(2));
+    assert_eq!(users.info.total_pages, Some(1));
+}
+
+#[tokio::test]
+async fn project_users_list_maps_null_body_to_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/users"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("null"))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let users = client
+        .list_project_users(7, PageParams::default(), None)
+        .await
+        .unwrap();
+    assert!(users.items.is_empty());
+}
+
+#[tokio::test]
+async fn project_users_grant_uses_put_with_username_payload() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/7/users"))
+        .and(body_json(json!({"username": "ada", "permission": 1})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 12, "username": "ada", "permission": 1,
+            "created": "2026-01-01T00:00:00Z", "updated": "2026-01-01T00:00:00Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let share = client
+        .add_project_user(
+            7,
+            &ProjectUserShareCreate {
+                username: "ada".into(),
+                permission: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(share.id, 12);
+    assert_eq!(share.username, "ada");
+    assert_eq!(share.permission, 1);
+}
+
+#[tokio::test]
+async fn project_users_update_posts_permission_to_user_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/projects/7/users/3"))
+        .and(body_json(json!({"permission": 2})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 12, "username": "ada", "permission": 2
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let share = client
+        .update_project_user(7, 3, &ProjectShareUpdate { permission: 2 })
+        .await
+        .unwrap();
+    assert_eq!(share.permission, 2);
+}
+
+#[tokio::test]
+async fn project_users_revoke_uses_delete() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/projects/7/users/3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": "The user was successfully removed from the project."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let message = client.remove_project_user(7, 3).await.unwrap();
+    assert!(message.message.contains("successfully"));
+}
+
+#[tokio::test]
+async fn project_teams_grant_update_revoke_round_trip() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/7/teams"))
+        .and(body_json(json!({"team_id": 4, "permission": 0})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 9, "team_id": 4, "permission": 0
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/projects/7/teams/4"))
+        .and(body_json(json!({"permission": 2})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "team_id": 4, "permission": 2
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/projects/7/teams/4"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": "The team was successfully deleted."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+
+    let granted = client
+        .add_project_team(
+            7,
+            &ProjectTeamShareCreate {
+                team_id: 4,
+                permission: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(granted.team_id, 4);
+    assert_eq!(granted.permission, 0);
+
+    let updated = client
+        .update_project_team(7, 4, &ProjectShareUpdate { permission: 2 })
+        .await
+        .unwrap();
+    assert_eq!(updated.permission, 2);
+
+    let message = client.remove_project_team(7, 4).await.unwrap();
+    assert!(message.message.contains("deleted"));
+}
+
+#[tokio::test]
+async fn project_users_grant_forbidden_maps_to_forbidden() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/7/users"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "code": 3004, "message": "You don't have the permission to do that."
+        })))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let err = client
+        .add_project_user(
+            7,
+            &ProjectUserShareCreate {
+                username: "ada".into(),
+                permission: 0,
+            },
+        )
+        .await
+        .unwrap_err();
+    match err {
+        Error::Api {
+            kind,
+            status,
+            code,
+            endpoint,
+            ..
+        } => {
+            assert_eq!(kind, ApiErrorKind::Forbidden);
+            assert_eq!(status, 403);
+            assert_eq!(code, Some(3004));
+            assert_eq!(endpoint, "project_users.grant");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn project_teams_revoke_missing_share_maps_to_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/projects/7/teams/4"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "code": 6002, "message": "The team does not have access to the project."
+        })))
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server.uri());
+    let err = client.remove_project_team(7, 4).await.unwrap_err();
+    match err {
+        Error::Api { kind, endpoint, .. } => {
+            assert_eq!(kind, ApiErrorKind::NotFound);
+            assert_eq!(endpoint, "project_teams.revoke");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
 }
 
 // ----- error mapping ---------------------------------------------------------------------

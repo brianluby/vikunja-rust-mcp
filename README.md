@@ -171,6 +171,13 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_task_attachments_delete` | Delete an attachment. |
 | `vikunja_users_search` | Search users (for assignment). |
 | `vikunja_teams_list` | List teams; with `project_id`, list the teams that can access that project including their permission level. Optional auto-pagination. |
+| `vikunja_project_users_list` | List the users with access to a project including their permission level. Optional auto-pagination. |
+| `vikunja_project_users_grant` | Grant a user (by username) access to a project at an explicit permission level. |
+| `vikunja_project_users_update` | Change an existing user share's permission level (by numeric user id). |
+| `vikunja_project_users_revoke` | Revoke a user's access to a project (by numeric user id). |
+| `vikunja_project_teams_grant` | Grant a team (by numeric team id) access to a project at an explicit permission level. |
+| `vikunja_project_teams_update` | Change an existing team share's permission level. |
+| `vikunja_project_teams_revoke` | Revoke a team's access to a project. |
 | `vikunja_filters_list` | List saved filters (durable, named task queries). |
 | `vikunja_filters_get` | Get one saved filter incl. its stored query. |
 | `vikunja_filters_create` | Create a saved filter from a filter expression + sort order. |
@@ -190,9 +197,9 @@ e.g. `done = false && due_date < now/d+7d`.
 ### Auto-pagination (bounded list-all)
 
 The paginated list tools — `vikunja_projects_list`, `vikunja_tasks_list`,
-`vikunja_labels_list`, `vikunja_task_attachments_list` and
-`vikunja_teams_list` (including its `project_id` project-teams form) — also
-accept:
+`vikunja_labels_list`, `vikunja_task_attachments_list`,
+`vikunja_project_users_list` and `vikunja_teams_list` (including its
+`project_id` project-teams form) — also accept:
 
 - `auto_paginate` (bool): fetch multiple pages starting at page 1 and return
   them as one result. Cannot be combined with `page` (use `per_page` to
@@ -334,6 +341,45 @@ The `*_bulk_*` tools are deliberately conservative:
   task with the updated task or a confirmation message on success, or a
   structured error (`kind`, HTTP status, Vikunja error code, message) on
   failure.
+
+### Project sharing and permissions
+
+The `vikunja_project_users_*` and `vikunja_project_teams_*` tools manage who
+can access a project. Permission levels follow Vikunja's `models.Permission`:
+
+| Level | Name | Meaning |
+|---|---|---|
+| `0` | read | View the project and its tasks. |
+| `1` | write | Additionally create and edit tasks. |
+| `2` | admin | Additionally manage the project itself and its shares. |
+
+Every grant/update takes an explicit numeric `permission` (0–2); values
+outside that range are rejected before any request. Results echo the level
+both numerically (`permission`) and by name (`permission_name`), along with
+`project_id`, the subject (`subject_type` plus `username`/`user_id`/
+`team_id`) and the share object Vikunja returned.
+
+Subject addressing follows the Vikunja API exactly:
+
+- **Granting to a user** addresses the user by their unique `username`
+  (`PUT /projects/{id}/users` has no numeric-id form). Look usernames up
+  with `vikunja_users_search`. The tool never creates users and never
+  guesses from display names.
+- **Updating or revoking a user share** addresses the existing share by
+  numeric `user_id` (as returned by `vikunja_project_users_list`).
+- **Team shares** use the numeric `team_id` everywhere (find it with
+  `vikunja_teams_list`).
+
+Updates use Vikunja's dedicated share-update endpoint — a permission change
+is never implemented as revoke-then-grant, so access is not dropped if the
+second step fails. The revoke tools are destructive (the share is removed
+immediately) and are marked with `destructive_hint` so MCP clients can
+require confirmation.
+
+These tools require an API token whose user has **admin** access to the
+project, and the token must include the project sharing scopes. Prefer a
+token scoped to exactly the projects you intend to manage; see the security
+notes below for guidance on admin-scoped tokens.
 
 ## Resources
 
@@ -551,17 +597,29 @@ entities (cleanup is best-effort).
   call) — filter-based bulk writes are not supported — and report partial
   failures per task instead of retrying or aborting the batch (see *Bulk
   semantics* above).
+- The project sharing tools change who can read and write your projects. An
+  agent holding an admin-capable token can grant itself or others access, so
+  treat such tokens like credentials for everything the projects contain:
+  scope tokens to the projects that actually need management, avoid
+  admin-scoped tokens in unattended deployments, and configure your MCP
+  client to require confirmation for `vikunja_project_users_grant`/`_update`/
+  `_revoke` and the `_teams_` equivalents. Grants require an explicit
+  username or team id and an explicit permission level — there is no
+  wildcard or name-guessing form — and revokes are flagged with
+  `destructive_hint`.
 
 ## Vikunja API capabilities intentionally omitted
 
 - **Pre-1.0 instances:** Vikunja < 1.0 used `GET /tasks/all`; this server
   targets the current stable API (`GET /tasks`).
-- **Reminders as first-class tools, reactions, link/user shares, webhooks,
+- **Reminders as first-class tools, reactions, link shares, webhooks,
   notifications, migrations**: out of scope for the core resource set this
   server exposes. Reminders still appear in task JSON where Vikunja returns
-  them. (Saved filters, task relations and read-only Kanban buckets *are*
-  supported — see the `vikunja_filters_*`, `vikunja_task_relations_*` and
-  `vikunja_buckets_list` tools.)
+  them. (Saved filters, task relations, read-only Kanban buckets and
+  project user/team sharing *are* supported — see the `vikunja_filters_*`,
+  `vikunja_task_relations_*`, `vikunja_buckets_list` and
+  `vikunja_project_users_*`/`vikunja_project_teams_*` tools. Link shares —
+  Vikunja's tokenized public URLs — remain omitted.)
 - **Kanban bucket writes** (creating/renaming/deleting buckets, moving
   tasks between buckets): bucket support is deliberately read-only.
 - **Vikunja's native bulk endpoints** (`/tasks/bulk`, label/assignee bulk):
@@ -571,7 +629,9 @@ entities (cleanup is best-effort).
   bulk endpoints are intentionally avoided so a single call cannot perform
   unbounded writes.
 - **Team create/update/delete and membership management:** only team
-  listing (global and per-project) is exposed, per the intended tool surface.
+  listing (global and per-project) and project team shares
+  (`vikunja_project_teams_*`) are exposed; teams themselves and their
+  member rosters cannot be changed through this server.
 - **Listing task assignees as a separate tool:** assignees are already
   included in `vikunja_tasks_get`; the client layer supports it for
   completeness.
