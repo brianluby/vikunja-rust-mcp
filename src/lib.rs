@@ -14,4 +14,5 @@ pub mod mcp;
 pub mod metrics;
 pub mod sandbox;
 pub mod schema;
+pub mod transfer;
 pub mod vikunja;

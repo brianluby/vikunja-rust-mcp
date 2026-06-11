@@ -401,6 +401,10 @@ numeric Vikunja ids, hex colors *without* `#`, and RFC 3339 timestamps
 | `vikunja_dates_resolve` | Preview how a date shortcut resolves to RFC 3339 (read-only, never calls Vikunja). |
 | `vikunja_project_views_list` | List a project's views (list/gantt/table/kanban) with their ids. |
 | `vikunja_buckets_list` | List a project's Kanban buckets (lanes) with names and the tasks in each (read-only). |
+| `vikunja_export_tasks` | Export tasks to JSON, Markdown checklist or CSV (read-only, bounded, deterministic). |
+| `vikunja_export_project` | Export one project's metadata and optionally its tasks to JSON/Markdown/CSV (read-only). |
+| `vikunja_import_tasks_markdown` | Import tasks from a Markdown checklist (dry-run by default; explicit write mode). |
+| `vikunja_import_tasks_csv` | Import tasks from a CSV backlog (dry-run by default; explicit write mode). |
 
 List tools return `{ items..., "pagination": { page, per_page, total_pages,
 result_count, has_more } }` built from Vikunja's `x-pagination-total-pages`
@@ -555,6 +559,99 @@ The `*_bulk_*` tools are deliberately conservative:
   task with the updated task or a confirmation message on success, or a
   structured error (`kind`, HTTP status, Vikunja error code, message) on
   failure.
+
+### Import/export workflows
+
+The export tools are **read-only** and produce deterministic documents for
+migration and reporting; the import tools create tasks from simple backlog
+files with a **dry-run preview by default**. Attachments and comments are
+not part of either direction in this version.
+
+#### Exporting
+
+- `vikunja_export_tasks` — `{ format: json|markdown|csv, project_id?,
+  filter?, search?, sort_by?, order_by?, max_pages? }`. Fetches up to
+  `max_pages` pages (1–50, default **10**; never unbounded) and renders one
+  document. The result carries `content`, `task_count` and an
+  `auto_pagination` block; `truncated: true` means the cap was hit and the
+  export is incomplete.
+- `vikunja_export_project` — `{ project_id, include_tasks, format,
+  max_pages? }`. Adds the project's metadata (id, identifier, title,
+  description, archive state, parent). CSV has no place for project
+  metadata, so `format: csv` requires `include_tasks: true`.
+
+Determinism: tasks are sorted by **id ascending** unless you pass `sort_by`
+(then the server order is kept); JSON field order and CSV column order are
+fixed; unset dates (Vikunja's `0001-01-01T00:00:00Z`) are omitted in JSON
+and empty in CSV; label titles and assignee usernames are sorted.
+
+Formats:
+
+- **json** — pretty-printed array of trimmed task objects (`id`,
+  `identifier`, `title`, `description`, `done`, dates, `priority`,
+  `percent_done`, `project_id`, `labels`, `assignees`). Project exports wrap
+  it as `{ "project": {...}, "tasks": [...] }`.
+- **markdown** — checklist: `- [ ] Title` / `- [x] Title`, description lines
+  indented two spaces below their task. Other fields are not represented;
+  use JSON/CSV for a complete export.
+- **csv** — header
+  `id,identifier,title,description,done,due_date,start_date,end_date,priority,percent_done,project_id,labels,assignees`;
+  RFC 4180 escaping (fields with commas, quotes or newlines are quoted,
+  quotes doubled), `\n` line endings, `labels`/`assignees` joined with `|`.
+
+#### Importing
+
+- `vikunja_import_tasks_markdown` — `{ project_id, markdown, dry_run? }`
+- `vikunja_import_tasks_csv` — `{ project_id, csv, dry_run? }`
+
+Both default to **`dry_run: true`**: every row is validated and the result
+previews the exact create payloads without writing anything. Pass
+`dry_run: false` to create tasks — write mode requires an explicit
+`project_id` and only ever creates tasks in that project.
+
+Markdown input:
+
+```markdown
+# Headings and blank lines are ignored
+
+- [ ] Ship the release
+  Description lines are indented
+  and joined together.
+- [x] Already done elsewhere
+```
+
+Tasks are `- [ ] Title` lines; indented lines below a task become its
+description. The `[x]` marker is accepted but **imported tasks are always
+created open** (Vikunja's create endpoint cannot create completed tasks) —
+complete them afterwards with the bulk tools. Any other line is reported as
+an invalid row.
+
+CSV input requires a header; supported columns: `title` (required),
+`description`, `due_date`, `priority`:
+
+```csv
+title,description,due_date,priority
+Ship the release,"Multi-line, quoted",2026-07-01T12:00:00Z,3
+Plan next sprint,,next friday,
+```
+
+`due_date` accepts RFC 3339 or the same [date shortcuts](#smart-date-shortcuts)
+as the task tools; `priority` must be 0–5. Unknown or duplicate columns are
+rejected — **labels are not imported** in this version, so a `labels` column
+is an error rather than silently ignored.
+
+Semantics and limits:
+
+- All rows are validated first. In dry-run the result reports `ok`,
+  `total`, `valid`, `invalid`, `would_create` and per-item previews
+  (`proposed` is the exact create payload).
+- In write mode, **nothing is written unless every row is valid** (valid
+  rows are reported as `skipped` next to the `invalid` ones), so a fixed
+  file can be re-imported without creating duplicates.
+- Writes happen one task at a time with **per-item results** (`created` /
+  `failed` with a structured error) and are never retried automatically.
+- Caps: input up to **256 KiB** and **100 tasks** per call; larger imports
+  must be split.
 
 ## Resources
 

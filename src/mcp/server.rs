@@ -91,7 +91,11 @@ impl ServerHandler for VikunjaMcpServer {
             "Dates are RFC 3339 timestamps like 2026-07-01T12:00:00Z; task ",
             "create/update also accept date shortcuts ('tomorrow', 'next friday', ",
             "'in 2 weeks', 'clear') via the *_shortcut fields — preview them with ",
-            "vikunja_dates_resolve."
+            "vikunja_dates_resolve. ",
+            "Backlogs move in and out via vikunja_export_tasks / vikunja_export_project ",
+            "(JSON, Markdown or CSV, read-only and bounded) and ",
+            "vikunja_import_tasks_markdown / vikunja_import_tasks_csv ",
+            "(dry-run preview by default; set dry_run: false to create)."
         ))
     }
 
