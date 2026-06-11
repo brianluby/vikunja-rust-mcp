@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::extract::Request;
 use axum::http::StatusCode;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -192,20 +192,38 @@ async fn telemetry(metrics: Option<Arc<Metrics>>, request: Request, next: Next) 
 }
 
 /// Rejects requests that do not carry `Authorization: Bearer <expected>`.
+/// Unauthorized responses carry a `WWW-Authenticate: Bearer` challenge as
+/// required by RFC 7235 §4.1.
 async fn require_bearer(expected: &ApiToken, request: Request, next: Next) -> Response {
     let authorized = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(bearer_token)
         .is_some_and(|presented| {
             constant_time_eq(presented.as_bytes(), expected.reveal().as_bytes())
         });
     if authorized {
         next.run(request).await
     } else {
-        (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response()
+        (
+            StatusCode::UNAUTHORIZED,
+            [(WWW_AUTHENTICATE, "Bearer")],
+            "unauthorized\n",
+        )
+            .into_response()
     }
+}
+
+/// Extracts the token from an `Authorization` header value using the
+/// `Bearer` scheme. The scheme name is matched case-insensitively (auth
+/// schemes are case-insensitive per RFC 7235 §2.1) and may be followed by
+/// one or more spaces (`1*SP`). Returns `None` for any other scheme or an
+/// empty token, so authentication still fails closed.
+fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    let token = token.trim_start_matches(' ');
+    (scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty()).then_some(token)
 }
 
 /// Compares two byte strings without short-circuiting on the first
@@ -263,6 +281,28 @@ mod tests {
             .await
             .expect("body");
         assert_eq!(&body[..], b"not ready: timeout\n");
+    }
+
+    #[test]
+    fn bearer_token_matches_scheme_case_insensitively() {
+        // RFC 7235 §2.1: auth scheme names are case-insensitive.
+        assert_eq!(bearer_token("Bearer secret"), Some("secret"));
+        assert_eq!(bearer_token("bearer secret"), Some("secret"));
+        assert_eq!(bearer_token("BEARER secret"), Some("secret"));
+        assert_eq!(bearer_token("bEaReR secret"), Some("secret"));
+        // 1*SP: extra spaces between scheme and token are tolerated.
+        assert_eq!(bearer_token("Bearer   secret"), Some("secret"));
+    }
+
+    #[test]
+    fn bearer_token_rejects_other_schemes_and_empty_tokens() {
+        assert_eq!(bearer_token("Basic c2VjcmV0"), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Bearer "), None);
+        assert_eq!(bearer_token("Bearer   "), None);
+        assert_eq!(bearer_token(""), None);
+        // The token itself stays case-sensitive: only the scheme is folded.
+        assert_eq!(bearer_token("Bearer Secret"), Some("Secret"));
     }
 
     #[test]

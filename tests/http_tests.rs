@@ -307,6 +307,45 @@ async fn probes_and_metrics_stay_open_while_mcp_requires_auth() {
         .await
         .expect("POST /mcp");
     assert_eq!(response.status(), 401);
+    // RFC 7235: a 401 must carry a challenge naming the expected scheme.
+    let challenge = response
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(challenge, "Bearer", "missing WWW-Authenticate challenge");
+
+    // The auth scheme is case-insensitive (RFC 7235): a mixed-case scheme
+    // with the correct token must pass the auth layer (any non-401 status
+    // means the request reached the MCP service).
+    let response = client
+        .post(format!("http://{addr}/mcp"))
+        .header("authorization", "bEaReR mcp-secret")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "http-test", "version": "0"}
+            }
+        }))
+        .send()
+        .await
+        .expect("POST /mcp mixed-case scheme");
+    assert_ne!(
+        response.status(),
+        401,
+        "mixed-case Bearer scheme must be accepted"
+    );
+
+    // A wrong token under a mixed-case scheme still fails closed.
+    let response = client
+        .post(format!("http://{addr}/mcp"))
+        .header("authorization", "bearer wrong-token")
+        .send()
+        .await
+        .expect("POST /mcp wrong token");
+    assert_eq!(response.status(), 401);
 
     // Unauthorized requests are still observable in the metrics.
     let body = reqwest::get(format!("http://{addr}/metrics"))

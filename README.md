@@ -607,8 +607,8 @@ entities (cleanup is best-effort).
 - The operational endpoints expose no secrets: `/healthz` returns a constant,
   `/readyz` returns only `ready` or a coarse error class (never tokens,
   headers, URLs or Vikunja response text), and `/metrics` (opt-in via
-  `MCP_HTTP_ENABLE_METRICS`) contains only counters with fixed
-  low-cardinality labels — no task titles/descriptions/comments, attachment
+  `MCP_HTTP_ENABLE_METRICS`) contains only counter and histogram metrics
+  with fixed low-cardinality labels — no task titles/descriptions/comments, attachment
   paths, ids or free-text values can appear in metric output. Structured
   request logs likewise record only route category, method, status class,
   endpoint category, error class and duration.

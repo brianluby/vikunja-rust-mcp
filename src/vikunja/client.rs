@@ -1175,7 +1175,12 @@ impl VikunjaClient {
             .get(self.api_url("/projects"))
             .query(&[("per_page", "1")]);
         let response = self.execute("status.probe", builder, true).await?;
-        Ok(response.status())
+        let status = response.status();
+        // Drain the (tiny, per_page=1) body so the connection returns to
+        // the keep-alive pool; dropping an unconsumed response forces the
+        // connection closed, which adds up under frequent readiness probes.
+        let _ = response.bytes().await;
+        Ok(status)
     }
 }
 

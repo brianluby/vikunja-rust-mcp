@@ -329,6 +329,26 @@ mod tests {
     }
 
     #[test]
+    fn no_exposition_line_starts_with_whitespace() {
+        // Prometheus text exposition lines must start at column 0; the
+        // `# HELP` / `# TYPE` string literals use `\`-continuations, which
+        // strip the newline and all leading whitespace of the next line.
+        let metrics = Metrics::default();
+        metrics.record_http_request("/mcp", "POST", 200, Duration::from_millis(7));
+        metrics.record_vikunja_request("tasks.get", "ok");
+        metrics.record_vikunja_retry("tasks.get");
+
+        let body = metrics.render();
+        for line in body.lines() {
+            assert!(
+                !line.starts_with([' ', '\t']),
+                "line starts with whitespace: {line:?}"
+            );
+        }
+        assert!(body.contains("\n# TYPE"), "comment lines must follow \\n");
+    }
+
+    #[test]
     fn empty_registry_still_renders_all_metric_families() {
         let body = Metrics::default().render();
         for needle in [
