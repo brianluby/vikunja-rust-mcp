@@ -48,6 +48,7 @@ Configuration comes from CLI flags or environment variables (flags win):
 | `MCP_HTTP_ALLOWED_HOSTS` | `--allowed-hosts` | no | – | Extra `Host` header values to accept (comma separated). `localhost`, `127.0.0.1`, `::1` and the bind IP are always accepted. |
 | `MCP_HTTP_AUTH_TOKEN` | `--http-auth-token` | for non-loopback HTTP | – | Bearer token clients must send (`Authorization: Bearer <token>`) to reach `/mcp`. Required when binding beyond loopback. |
 | `MCP_HTTP_ALLOW_UNAUTHENTICATED` | `--http-allow-unauthenticated` | no | `false` | Explicitly serve `/mcp` without authentication on non-loopback binds (only behind an authenticating reverse proxy). |
+| `MCP_HTTP_ENABLE_METRICS` | `--http-enable-metrics` | no | `false` | Expose Prometheus metrics at `GET /metrics` on the HTTP transport. Invalid with `--transport stdio` (fails fast at startup). See *Operating the HTTP transport*. |
 | `VIKUNJA_TIMEOUT_SECS` | `--timeout-secs` | no | `30` | Per-request timeout against the Vikunja API. |
 | `VIKUNJA_DEFAULT_PAGE_SIZE` | `--default-page-size` | no | `50` | `per_page` used when a tool call does not specify one (1–250; the Vikunja server also caps it). |
 | `VIKUNJA_DATE_DEFAULT_TIME` | `--date-default-time` | no | `09:00` | Time of day (`HH:MM`) applied when a date shortcut resolves to a calendar day (see *Smart date shortcuts*). |
@@ -118,6 +119,63 @@ with other `Host` headers are rejected to prevent DNS-rebinding.
 
 Logging goes to **stderr** (stdout carries the protocol in stdio mode) and is
 controlled with `RUST_LOG`, e.g. `RUST_LOG=vikunja_rust_mcp=debug`.
+
+### Operating the HTTP transport (health, readiness, metrics)
+
+Three operational endpoints help hosted deployments distinguish "process is
+up" from "Vikunja is reachable" and observe traffic:
+
+| Endpoint | Auth | Behavior |
+|---|---|---|
+| `GET /healthz` | none | Cheap liveness: answers `ok` without touching Vikunja. Use for liveness probes and restart decisions. |
+| `GET /readyz` | none | Readiness: performs the same lightweight authenticated probe as the `vikunja://status` resource (one `GET /api/v1/projects?per_page=1`). Answers `200 ready` or `503 not ready: <class>` where `<class>` is a coarse error class (`network`, `timeout`, `auth`, `server`, ...). Use for readiness/traffic gating. |
+| `GET /metrics` | none, **disabled by default** | Prometheus text exposition; only served when `--http-enable-metrics` / `MCP_HTTP_ENABLE_METRICS=true` is set (404 otherwise). |
+
+`/readyz` and `/metrics` are deliberately **unauthenticated** (like
+`/healthz`) so orchestrator probes and scrapers work without credentials.
+That is safe because their responses carry no secrets: `/readyz` reports
+only a coarse error class — never tokens, headers, URLs or Vikunja response
+text — and metrics use only fixed low-cardinality labels. Note that each
+`/readyz` call makes one small authenticated request to Vikunja, so point
+orchestrator probes at it at a modest interval (e.g. every 10s). If the
+endpoints must not be public, keep the bind loopback-only or restrict them
+at the reverse proxy.
+
+Exposed metrics (all labels are fixed, low-cardinality values — no task
+ids, project ids, user ids, titles or error messages):
+
+- `vikunja_mcp_http_requests_total{route,method,status}` — requests by route
+  category (`/mcp`, `/healthz`, `/readyz`, `/metrics`, `other`), method and
+  status class (`2xx`, `4xx`, ...).
+- `vikunja_mcp_http_request_duration_seconds` — request duration histogram.
+- `vikunja_mcp_vikunja_requests_total{endpoint,outcome}` — upstream Vikunja
+  API requests by endpoint category (`tasks.get`, `projects.list`, ...) and
+  outcome (`ok` or an error class such as `network`, `timeout`, `auth`,
+  `not_found`, `server`).
+- `vikunja_mcp_vikunja_retries_total{endpoint}` — idempotent upstream
+  requests that were retried once.
+
+Tool calls reach Vikunja through those endpoint categories, so
+`vikunja_mcp_vikunja_requests_total` is also the per-tool-family error/usage
+signal; separate per-MCP-tool duration metrics are intentionally not
+emitted to keep the instrumentation in the HTTP/client layers.
+
+Example Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: vikunja-mcp
+    static_configs:
+      - targets: ["mcp.example.com:8077"]
+    metrics_path: /metrics
+    scrape_interval: 30s
+```
+
+Each HTTP request also emits one structured log line on stderr (route
+category, method, status class, duration); probe and scrape routes log at
+`debug` level so orchestrator polling does not flood the logs. Vikunja API
+requests log endpoint category, status, error class and duration. Log
+fields never include tokens, headers, raw paths/queries or task content.
 
 ## Tools
 
@@ -496,7 +554,9 @@ for config/error/pagination/models, [`wiremock`](https://crates.io/crates/wiremo
 HTTP tests of the API client (request building, pagination headers,
 merge-update bodies, error mapping, retry behavior), end-to-end MCP tests
 driving every tool through a real rmcp client over an in-memory transport,
-and smoke tests of the compiled binary over both stdio and HTTP.
+in-process tests of the HTTP router (`/healthz`, `/readyz`, `/metrics`,
+bearer auth), and smoke tests of the compiled binary over both stdio and
+HTTP.
 
 ### Optional live integration tests
 
@@ -544,6 +604,14 @@ entities (cleanup is best-effort).
   passed for reverse-proxy deployments. The `Host` allow-list additionally
   guards against DNS-rebinding. Use TLS (via a reverse proxy) for any
   non-local deployment so the bearer token is not sent in cleartext.
+- The operational endpoints expose no secrets: `/healthz` returns a constant,
+  `/readyz` returns only `ready` or a coarse error class (never tokens,
+  headers, URLs or Vikunja response text), and `/metrics` (opt-in via
+  `MCP_HTTP_ENABLE_METRICS`) contains only counters with fixed
+  low-cardinality labels — no task titles/descriptions/comments, attachment
+  paths, ids or free-text values can appear in metric output. Structured
+  request logs likewise record only route category, method, status class,
+  endpoint category, error class and duration.
 - Attachment uploads are capped at 20 MiB and rejected before the file is
   read into memory; inline downloads are capped at 2 MiB and aborted without
   buffering; `save_path` downloads stream to disk.
