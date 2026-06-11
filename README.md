@@ -15,13 +15,93 @@ tools.
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024) to build.
+- Rust 1.88+ (edition 2024) to build (only when building from source; the
+  locked dependency graph requires 1.88).
 - A Vikunja instance (1.0 or later) and an **API token**: in Vikunja go to
   *Settings → API Tokens* and create a token with the scopes you want this
   server to use (projects, tasks, labels, task comments, attachments, users,
   teams). Operations whose scope is missing fail with a clear `403` error.
 
-## Build
+## Install
+
+### Prebuilt binaries
+
+Tagged releases publish Linux, macOS and Windows packages. Replace `0.3.0`
+with the version you want:
+
+```bash
+VERSION=0.3.0
+curl -L -o vikunja-rust-mcp.tar.gz \
+  "https://github.com/brianluby/vikunja-rust-mcp/releases/download/v${VERSION}/vikunja-rust-mcp-linux-x86_64.tar.gz"
+curl -L -O \
+  "https://github.com/brianluby/vikunja-rust-mcp/releases/download/v${VERSION}/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf vikunja-rust-mcp.tar.gz
+install -m 0755 vikunja-rust-mcp ~/.local/bin/vikunja-rust-mcp
+```
+
+Use `vikunja-rust-mcp-macos-aarch64.tar.gz` on Apple Silicon macOS
+(replace `sha256sum -c SHA256SUMS --ignore-missing` with
+`shasum -a 256 -c SHA256SUMS --ignore-missing` — macOS has no GNU
+`sha256sum`) and `vikunja-rust-mcp-windows-x86_64.zip` on Windows.
+
+The checksum step above verifies integrity only. To verify authenticity
+(Sigstore cosign signatures and GitHub build provenance), see
+[Verifying a download](#verifying-a-download) under *Release Artifacts*.
+
+### Docker
+
+Images are published to GitHub Container Registry as
+`ghcr.io/brianluby/vikunja-rust-mcp:<version>`. The runtime image uses a
+distroless nonroot base and carries OCI labels
+(`org.opencontainers.image.source`, `.description`, `.licenses`,
+`.version`) identifying its source repository and release.
+
+Run stdio mode for local MCP clients:
+
+```bash
+docker run --rm -i \
+  -e VIKUNJA_URL=https://try.vikunja.io \
+  -e VIKUNJA_API_TOKEN=tk_... \
+  ghcr.io/brianluby/vikunja-rust-mcp:0.3.0
+```
+
+Run HTTP mode locally:
+
+```bash
+docker run --rm \
+  -p 127.0.0.1:8077:8077 \
+  -e VIKUNJA_URL=https://try.vikunja.io \
+  -e VIKUNJA_API_TOKEN=tk_... \
+  -e MCP_TRANSPORT=http \
+  -e MCP_HTTP_BIND=0.0.0.0:8077 \
+  -e MCP_HTTP_AUTH_TOKEN=$(openssl rand -hex 32) \
+  ghcr.io/brianluby/vikunja-rust-mcp:0.3.0
+```
+
+The liveness endpoint is `http://127.0.0.1:8077/healthz`; the MCP endpoint is
+`http://127.0.0.1:8077/mcp` and requires the bearer token above.
+
+For a reverse-proxy deployment, bind inside the container and allow the public
+hostname clients will use:
+
+```bash
+docker run -d --name vikunja-rust-mcp \
+  --restart unless-stopped \
+  -p 127.0.0.1:8077:8077 \
+  -e VIKUNJA_URL=https://vikunja.example.com \
+  -e VIKUNJA_API_TOKEN=tk_... \
+  -e MCP_TRANSPORT=http \
+  -e MCP_HTTP_BIND=0.0.0.0:8077 \
+  -e MCP_HTTP_ALLOWED_HOSTS=mcp.example.com \
+  -e MCP_HTTP_AUTH_TOKEN=change-me-to-a-long-random-token \
+  ghcr.io/brianluby/vikunja-rust-mcp:0.3.0
+```
+
+Terminate TLS at the reverse proxy and forward `/mcp` and `/healthz` to
+`127.0.0.1:8077`.
+
+## Build From Source
 
 ```bash
 cargo build --release
@@ -33,7 +113,90 @@ cargo build --release
 Tagged releases publish platform packages for Linux, macOS and Windows. Each
 release also includes `vikunja-rust-mcp-sbom.cdx.json`, a CycloneDX 1.5 SBOM
 generated from the locked Cargo dependency graph with all features and targets
-included.
+included, plus the following verification material:
+
+- `SHA256SUMS` — SHA-256 checksums of the archives and SBOM (the `.sig`/`.pem`
+  files are produced after the checksum file and are not listed in it; they
+  are verified via cosign instead).
+- `<artifact>.sig` / `<artifact>.pem` — Sigstore cosign keyless signatures
+  (and the short-lived signing certificate) for each archive, the SBOM and
+  `SHA256SUMS`, produced via the GitHub OIDC identity of the release workflow.
+- GitHub build provenance attestations (SLSA) for each archive, recorded via
+  `actions/attest-build-provenance` and queryable with the `gh` CLI.
+
+No long-lived signing keys exist for cosign or attestations; trust is rooted
+in the repository's GitHub Actions OIDC identity. Apple signing credentials,
+when configured, live only in GitHub Actions secrets.
+
+Version tags also publish Docker images to
+`ghcr.io/brianluby/vikunja-rust-mcp` — see the [Docker](#docker) install
+section above.
+
+### Verifying a download
+
+Checksums (verifies only the file you downloaded):
+
+```bash
+grep vikunja-rust-mcp-macos-aarch64.tar.gz SHA256SUMS | shasum -a 256 --check
+```
+
+Cosign signature (keyless; requires [cosign](https://docs.sigstore.dev/)):
+
+```bash
+cosign verify-blob \
+  --signature vikunja-rust-mcp-macos-aarch64.tar.gz.sig \
+  --certificate vikunja-rust-mcp-macos-aarch64.tar.gz.pem \
+  --certificate-identity-regexp \
+    'https://github.com/brianluby/vikunja-rust-mcp/\.github/workflows/build\.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  vikunja-rust-mcp-macos-aarch64.tar.gz
+```
+
+Build provenance (requires the [gh](https://cli.github.com/) CLI):
+
+```bash
+gh attestation verify vikunja-rust-mcp-macos-aarch64.tar.gz \
+  --repo brianluby/vikunja-rust-mcp \
+  --signer-workflow brianluby/vikunja-rust-mcp/.github/workflows/build.yml
+```
+
+### macOS Gatekeeper
+
+When the `APPLE_CERTIFICATE_P12` secret is configured, tagged builds sign the
+macOS binary in the build job with a Developer ID Application certificate
+(hardened runtime, secure timestamp) and notarize it with `notarytool`, so
+downloads run without manual steps. Notarization tickets cannot be stapled to
+bare executables; Gatekeeper fetches the ticket online on first run. Inspect
+a signed binary with:
+
+```bash
+codesign --display --verbose=2 ./vikunja-rust-mcp
+spctl --assess --type execute --verbose ./vikunja-rust-mcp
+```
+
+Without an Apple Developer account the binary carries only the ad-hoc linker
+signature, and a browser download gains a `com.apple.quarantine` attribute
+that makes Gatekeeper kill it with SIGKILL (`Code Signature Invalid`). Two
+equivalent workarounds after verifying the checksum/signature above:
+
+```bash
+# remove the quarantine attribute
+xattr -d com.apple.quarantine ./vikunja-rust-mcp
+
+# or re-sign locally with a fresh ad-hoc signature
+codesign --force --sign - ./vikunja-rust-mcp
+```
+
+Downloads made with `curl`/`wget` are not quarantined and run as-is.
+
+### Windows code signing
+
+Windows binaries are currently unsigned; SmartScreen may warn on first run.
+Authenticode signing was evaluated: classic OV/EV certificates require a paid
+CA subscription and (since 2023) hardware-backed keys, and Azure Trusted
+Signing requires an Azure tenant. Either can be added to the release workflow
+later without changing artifact layout; until then, verify downloads with the
+cosign signature and checksums above.
 
 ## Configuration
 
@@ -48,6 +211,7 @@ Configuration comes from CLI flags or environment variables (flags win):
 | `MCP_HTTP_ALLOWED_HOSTS` | `--allowed-hosts` | no | – | Extra `Host` header values to accept (comma separated). `localhost`, `127.0.0.1`, `::1` and the bind IP are always accepted. |
 | `MCP_HTTP_AUTH_TOKEN` | `--http-auth-token` | for non-loopback HTTP | – | Bearer token clients must send (`Authorization: Bearer <token>`) to reach `/mcp`. Required when binding beyond loopback. |
 | `MCP_HTTP_ALLOW_UNAUTHENTICATED` | `--http-allow-unauthenticated` | no | `false` | Explicitly serve `/mcp` without authentication on non-loopback binds (only behind an authenticating reverse proxy). |
+| `MCP_HTTP_ENABLE_METRICS` | `--http-enable-metrics` | no | `false` | Expose Prometheus metrics at `GET /metrics` on the HTTP transport. Invalid with `--transport stdio` (fails fast at startup). See *Operating the HTTP transport*. |
 | `VIKUNJA_TIMEOUT_SECS` | `--timeout-secs` | no | `30` | Per-request timeout against the Vikunja API. |
 | `VIKUNJA_DEFAULT_PAGE_SIZE` | `--default-page-size` | no | `50` | `per_page` used when a tool call does not specify one (1–250; the Vikunja server also caps it). |
 | `VIKUNJA_DATE_DEFAULT_TIME` | `--date-default-time` | no | `09:00` | Time of day (`HH:MM`) applied when a date shortcut resolves to a calendar day (see *Smart date shortcuts*). |
@@ -118,6 +282,63 @@ with other `Host` headers are rejected to prevent DNS-rebinding.
 
 Logging goes to **stderr** (stdout carries the protocol in stdio mode) and is
 controlled with `RUST_LOG`, e.g. `RUST_LOG=vikunja_rust_mcp=debug`.
+
+### Operating the HTTP transport (health, readiness, metrics)
+
+Three operational endpoints help hosted deployments distinguish "process is
+up" from "Vikunja is reachable" and observe traffic:
+
+| Endpoint | Auth | Behavior |
+|---|---|---|
+| `GET /healthz` | none | Cheap liveness: answers `ok` without touching Vikunja. Use for liveness probes and restart decisions. |
+| `GET /readyz` | none | Readiness: performs the same lightweight authenticated probe as the `vikunja://status` resource (one `GET /api/v1/projects?per_page=1`). Answers `200 ready` or `503 not ready: <class>` where `<class>` is a coarse error class (`network`, `timeout`, `auth`, `server`, ...). The probe is capped at **5 s** regardless of `VIKUNJA_TIMEOUT_SECS`, so a hung instance fails closed quickly instead of stalling the orchestrator's own probe timeout. Use for readiness/traffic gating. |
+| `GET /metrics` | none, **disabled by default** | Prometheus text exposition; only served when `--http-enable-metrics` / `MCP_HTTP_ENABLE_METRICS=true` is set (404 otherwise). |
+
+`/readyz` and `/metrics` are deliberately **unauthenticated** (like
+`/healthz`) so orchestrator probes and scrapers work without credentials.
+That is safe because their responses carry no secrets: `/readyz` reports
+only a coarse error class — never tokens, headers, URLs or Vikunja response
+text — and metrics use only fixed low-cardinality labels. Note that each
+`/readyz` call makes one small authenticated request to Vikunja, so point
+orchestrator probes at it at a modest interval (e.g. every 10s). If the
+endpoints must not be public, keep the bind loopback-only or restrict them
+at the reverse proxy.
+
+Exposed metrics (all labels are fixed, low-cardinality values — no task
+ids, project ids, user ids, titles or error messages):
+
+- `vikunja_mcp_http_requests_total{route,method,status}` — requests by route
+  category (`/mcp`, `/healthz`, `/readyz`, `/metrics`, `other`), method and
+  status class (`2xx`, `4xx`, ...).
+- `vikunja_mcp_http_request_duration_seconds` — request duration histogram.
+- `vikunja_mcp_vikunja_requests_total{endpoint,outcome}` — upstream Vikunja
+  API requests by endpoint category (`tasks.get`, `projects.list`, ...) and
+  outcome (`ok` or an error class such as `network`, `timeout`, `auth`,
+  `not_found`, `server`).
+- `vikunja_mcp_vikunja_retries_total{endpoint}` — idempotent upstream
+  requests that were retried once.
+
+Tool calls reach Vikunja through those endpoint categories, so
+`vikunja_mcp_vikunja_requests_total` is also the per-tool-family error/usage
+signal; separate per-MCP-tool duration metrics are intentionally not
+emitted to keep the instrumentation in the HTTP/client layers.
+
+Example Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: vikunja-mcp
+    static_configs:
+      - targets: ["mcp.example.com:8077"]
+    metrics_path: /metrics
+    scrape_interval: 30s
+```
+
+Each HTTP request also emits one structured log line on stderr (route
+category, method, status class, duration); probe and scrape routes log at
+`debug` level so orchestrator polling does not flood the logs. Vikunja API
+requests log endpoint category, status, error class and duration. Log
+fields never include tokens, headers, raw paths/queries or task content.
 
 ## Tools
 
@@ -593,7 +814,9 @@ for config/error/pagination/models, [`wiremock`](https://crates.io/crates/wiremo
 HTTP tests of the API client (request building, pagination headers,
 merge-update bodies, error mapping, retry behavior), end-to-end MCP tests
 driving every tool through a real rmcp client over an in-memory transport,
-and smoke tests of the compiled binary over both stdio and HTTP.
+in-process tests of the HTTP router (`/healthz`, `/readyz`, `/metrics`,
+bearer auth), and smoke tests of the compiled binary over both stdio and
+HTTP.
 
 ### Optional live integration tests
 
@@ -641,6 +864,14 @@ entities (cleanup is best-effort).
   passed for reverse-proxy deployments. The `Host` allow-list additionally
   guards against DNS-rebinding. Use TLS (via a reverse proxy) for any
   non-local deployment so the bearer token is not sent in cleartext.
+- The operational endpoints expose no secrets: `/healthz` returns a constant,
+  `/readyz` returns only `ready` or a coarse error class (never tokens,
+  headers, URLs or Vikunja response text), and `/metrics` (opt-in via
+  `MCP_HTTP_ENABLE_METRICS`) contains only counter and histogram metrics
+  with fixed low-cardinality labels — no task titles/descriptions/comments, attachment
+  paths, ids or free-text values can appear in metric output. Structured
+  request logs likewise record only route category, method, status class,
+  endpoint category, error class and duration.
 - Attachment uploads are capped at 20 MiB and rejected before the file is
   read into memory; inline downloads are capped at 2 MiB and aborted without
   buffering; `save_path` downloads stream to disk.

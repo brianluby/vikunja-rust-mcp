@@ -16,6 +16,8 @@ jobs:
   build:
     name: Build ${{ matrix.platform.name }}
     runs-on: ${{ matrix.platform.os }}
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +48,66 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      # Signs and notarizes the macOS binary when Apple signing secrets are
+      # configured; otherwise the binary ships with the default ad-hoc linker
+      # signature and the README documents the Gatekeeper workaround.
+      # Stapling is skipped: tickets cannot be stapled to bare Mach-O
+      # executables, Gatekeeper fetches the notarization ticket online.
+      - name: Sign and notarize macOS binary
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v') && env.HAS_APPLE_CERT == 'true'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          BINARY_NAME: ${{ matrix.platform.binary_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail closed: a partial Apple secret set is a misconfiguration that
+          # must break the release, not silently ship an unsigned binary.
+          for var in APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                     APPLE_NOTARY_KEY APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::APPLE_CERTIFICATE_P12 is set but $var is empty; configure the full Apple signing secret set or remove APPLE_CERTIFICATE_P12 to skip signing"
+              exit 1
+            fi
+          done
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          cleanup() {
+            security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+            rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary-key.p8" "$RUNNER_TEMP/notarize.zip"
+          }
+          trap cleanup EXIT
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 1200 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S 'apple-tool:,apple:' \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          codesign --force --timestamp --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "target/release/$BINARY_NAME"
+          codesign --verify --strict --verbose=2 \
+            "target/release/$BINARY_NAME"
+
+          printf '%s' "$APPLE_NOTARY_KEY" > "$RUNNER_TEMP/notary-key.p8"
+          ditto -c -k "target/release/$BINARY_NAME" \
+            "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary-key.p8" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait
+
       - name: Package Unix binary
         if: runner.os != 'Windows'
         shell: bash
@@ -55,6 +117,41 @@ jobs:
           chmod +x "dist/${{ matrix.platform.binary_name }}"
           tar -czf "dist/${{ matrix.platform.artifact_name }}.tar.gz" -C dist "${{ matrix.platform.binary_name }}"
 
+      - name: Smoke packaged Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VIKUNJA_URL: https://vikunja.example.test
+          VIKUNJA_API_TOKEN: smoke-test-token
+        run: |
+          mkdir -p smoke
+          tar -xzf "dist/${{ matrix.platform.artifact_name }}.tar.gz" -C smoke
+          "smoke/${{ matrix.platform.binary_name }}" --transport http --bind 127.0.0.1:8077 >smoke/stdout.log 2>smoke/stderr.log &
+          pid=$!
+          # shellcheck disable=SC2329  # invoked via trap
+          cleanup() {
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            body=$(curl --fail --silent http://127.0.0.1:8077/healthz || true)
+            if [ "$body" = "ok" ]; then
+              exit 0
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              printf 'packaged binary exited before health check passed\n'
+              printf 'stderr:\n'
+              sed -n '1,120p' smoke/stderr.log
+              exit 1
+            fi
+            sleep 0.5
+          done
+          printf 'timed out waiting for packaged binary health check\n'
+          printf 'stderr:\n'
+          sed -n '1,120p' smoke/stderr.log
+          exit 1
+
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -62,6 +159,43 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target/release/${{ matrix.platform.binary_name }}" "dist/${{ matrix.platform.binary_name }}"
           Compress-Archive -Path "dist/${{ matrix.platform.binary_name }}" -DestinationPath "dist/${{ matrix.platform.artifact_name }}.zip"
+
+      - name: Smoke packaged Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VIKUNJA_URL: https://vikunja.example.test
+          VIKUNJA_API_TOKEN: smoke-test-token
+        run: |
+          New-Item -ItemType Directory -Force -Path smoke | Out-Null
+          Expand-Archive -Path "dist/${{ matrix.platform.artifact_name }}.zip" -DestinationPath smoke
+          $process = Start-Process -FilePath "smoke/${{ matrix.platform.binary_name }}" -ArgumentList "--transport", "http", "--bind", "127.0.0.1:8077" -PassThru -RedirectStandardOutput "smoke/stdout.log" -RedirectStandardError "smoke/stderr.log"
+          try {
+            for ($i = 0; $i -lt 20; $i++) {
+              try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:8077/healthz" -UseBasicParsing -TimeoutSec 2
+                if ($response.Content -eq "ok") {
+                  exit 0
+                }
+              } catch {
+              }
+              if ($process.HasExited) {
+                Write-Output "packaged binary exited before health check passed"
+                Write-Output "stderr:"
+                Get-Content "smoke/stderr.log"
+                exit 1
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            Write-Output "timed out waiting for packaged binary health check"
+            Write-Output "stderr:"
+            Get-Content "smoke/stderr.log"
+            exit 1
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -72,13 +206,71 @@ jobs:
             dist/*.zip
           if-no-files-found: error
 
+  docker:
+    name: Build Docker image
+    needs: build
+    # PRs: build but never push (login and push are both gated on != pull_request).
+    # Pushes to main and v* tags: build and push. workflow_dispatch on a feature
+    # branch is intentionally skipped so no branch-named tags reach GHCR.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # This job never pushes git commits; keep the token out of git config.
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{raw}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and publish Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version || 'dev' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   release:
     name: Publish release packages
+    # Deliberately independent of the docker job: a transient registry or
+    # BuildKit failure must not block publishing the binary archives and SBOM.
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout
@@ -108,6 +300,36 @@ jobs:
             --spec-version 1.5 \
             --override-filename vikunja-rust-mcp-sbom.cdx
           mv vikunja-rust-mcp-sbom.cdx.json release/vikunja-rust-mcp-sbom.cdx.json
+
+      - name: Generate checksums
+        run: |
+          cd release
+          # Write outside release/ first so the glob cannot pick up a
+          # partially written SHA256SUMS and hash the checksum file itself.
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            release/*.tar.gz
+            release/*.zip
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+
+      # Keyless signing via the GitHub OIDC identity of this workflow run.
+      # Verification material (.sig + .pem) is published next to each artifact.
+      - name: Sign artifacts and checksums with cosign
+        run: |
+          set -euo pipefail
+          for f in release/*.tar.gz release/*.zip release/*.cdx.json release/SHA256SUMS; do
+            cosign sign-blob --yes \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.pem" \
+              "$f"
+          done
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

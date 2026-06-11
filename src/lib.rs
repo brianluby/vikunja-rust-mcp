@@ -9,7 +9,9 @@
 pub mod config;
 pub mod dates;
 pub mod error;
+pub mod http;
 pub mod mcp;
+pub mod metrics;
 pub mod sandbox;
 pub mod schema;
 pub mod transfer;
