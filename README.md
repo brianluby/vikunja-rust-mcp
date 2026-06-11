@@ -78,9 +78,9 @@ gh attestation verify vikunja-rust-mcp-macos-aarch64.tar.gz \
 
 ### macOS Gatekeeper
 
-When the `APPLE_CERTIFICATE_P12` secret is configured, the release workflow
-signs the macOS binary with a Developer ID Application certificate
-(hardened runtime, secure timestamp) and notarizes it with `notarytool`, so
+When the `APPLE_CERTIFICATE_P12` secret is configured, tagged builds sign the
+macOS binary in the build job with a Developer ID Application certificate
+(hardened runtime, secure timestamp) and notarize it with `notarytool`, so
 downloads run without manual steps. Notarization tickets cannot be stapled to
 bare executables; Gatekeeper fetches the ticket online on first run. Inspect
 a signed binary with:

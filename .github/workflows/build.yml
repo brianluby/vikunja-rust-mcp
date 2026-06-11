@@ -66,6 +66,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Fail closed: a partial Apple secret set is a misconfiguration that
+          # must break the release, not silently ship an unsigned binary.
+          for var in APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                     APPLE_NOTARY_KEY APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::APPLE_CERTIFICATE_P12 is set but $var is empty; configure the full Apple signing secret set or remove APPLE_CERTIFICATE_P12 to skip signing"
+              exit 1
+            fi
+          done
           KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
           KEYCHAIN_PASSWORD="$(uuidgen)"
           cleanup() {
@@ -170,14 +179,14 @@ jobs:
           sha256sum * > SHA256SUMS
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
             release/*.tar.gz
             release/*.zip
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
 
       # Keyless signing via the GitHub OIDC identity of this workflow run.
       # Verification material (.sig + .pem) is published next to each artifact.
