@@ -232,7 +232,10 @@ fn csv_records(input: &str) -> Result<Vec<(usize, Vec<String>)>, String> {
 
     let mut end_record = |fields: &mut Vec<String>, field: &mut String, record_line: usize| {
         fields.push(std::mem::take(field));
-        let blank = fields.iter().all(|value| value.trim().is_empty());
+        // Only a single whitespace-only field is a blank line. A record
+        // like `,` is a data row with empty fields and must be kept so
+        // row-level validation can report it with its line number.
+        let blank = fields.len() == 1 && fields[0].trim().is_empty();
         if !blank {
             records.push((record_line, std::mem::take(fields)));
         } else {
@@ -512,5 +515,23 @@ mod tests {
     fn csv_skips_blank_lines() {
         let rows = parse_csv("title\n\nTask A\n\n").unwrap();
         assert_eq!(ok(&rows).len(), 1);
+    }
+
+    #[test]
+    fn csv_all_empty_rows_are_reported_not_skipped() {
+        // A `,`-only line is a data row with empty fields (RFC 4180), not a
+        // blank line: it must surface as a row error, not vanish.
+        let rows = parse_csv("title,priority\n,\nReal,1\n").unwrap();
+        let problems = issues(&rows);
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].line, 2);
+        assert!(problems[0].message.contains("title"), "{problems:?}");
+        assert_eq!(ok(&rows).len(), 1);
+
+        // Wrong column count of an all-empty row is reported too.
+        let rows = parse_csv("title\n,,\nReal\n").unwrap();
+        let problems = issues(&rows);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].message.contains("1 column"), "{problems:?}");
     }
 }
