@@ -117,6 +117,41 @@ jobs:
           chmod +x "dist/${{ matrix.platform.binary_name }}"
           tar -czf "dist/${{ matrix.platform.artifact_name }}.tar.gz" -C dist "${{ matrix.platform.binary_name }}"
 
+      - name: Smoke packaged Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VIKUNJA_URL: https://vikunja.example.test
+          VIKUNJA_API_TOKEN: smoke-test-token
+        run: |
+          mkdir -p smoke
+          tar -xzf "dist/${{ matrix.platform.artifact_name }}.tar.gz" -C smoke
+          "smoke/${{ matrix.platform.binary_name }}" --transport http --bind 127.0.0.1:8077 >smoke/stdout.log 2>smoke/stderr.log &
+          pid=$!
+          # shellcheck disable=SC2329  # invoked via trap
+          cleanup() {
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            body=$(curl --fail --silent http://127.0.0.1:8077/healthz || true)
+            if [ "$body" = "ok" ]; then
+              exit 0
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              printf 'packaged binary exited before health check passed\n'
+              printf 'stderr:\n'
+              sed -n '1,120p' smoke/stderr.log
+              exit 1
+            fi
+            sleep 0.5
+          done
+          printf 'timed out waiting for packaged binary health check\n'
+          printf 'stderr:\n'
+          sed -n '1,120p' smoke/stderr.log
+          exit 1
+
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -124,6 +159,43 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target/release/${{ matrix.platform.binary_name }}" "dist/${{ matrix.platform.binary_name }}"
           Compress-Archive -Path "dist/${{ matrix.platform.binary_name }}" -DestinationPath "dist/${{ matrix.platform.artifact_name }}.zip"
+
+      - name: Smoke packaged Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VIKUNJA_URL: https://vikunja.example.test
+          VIKUNJA_API_TOKEN: smoke-test-token
+        run: |
+          New-Item -ItemType Directory -Force -Path smoke | Out-Null
+          Expand-Archive -Path "dist/${{ matrix.platform.artifact_name }}.zip" -DestinationPath smoke
+          $process = Start-Process -FilePath "smoke/${{ matrix.platform.binary_name }}" -ArgumentList "--transport", "http", "--bind", "127.0.0.1:8077" -PassThru -RedirectStandardOutput "smoke/stdout.log" -RedirectStandardError "smoke/stderr.log"
+          try {
+            for ($i = 0; $i -lt 20; $i++) {
+              try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:8077/healthz" -UseBasicParsing -TimeoutSec 2
+                if ($response.Content -eq "ok") {
+                  exit 0
+                }
+              } catch {
+              }
+              if ($process.HasExited) {
+                Write-Output "packaged binary exited before health check passed"
+                Write-Output "stderr:"
+                Get-Content "smoke/stderr.log"
+                exit 1
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            Write-Output "timed out waiting for packaged binary health check"
+            Write-Output "stderr:"
+            Get-Content "smoke/stderr.log"
+            exit 1
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -134,8 +206,64 @@ jobs:
             dist/*.zip
           if-no-files-found: error
 
+  docker:
+    name: Build Docker image
+    needs: build
+    # PRs: build but never push (login and push are both gated on != pull_request).
+    # Pushes to main and v* tags: build and push. workflow_dispatch on a feature
+    # branch is intentionally skipped so no branch-named tags reach GHCR.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # This job never pushes git commits; keep the token out of git config.
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{raw}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and publish Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version || 'dev' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   release:
     name: Publish release packages
+    # Deliberately independent of the docker job: a transient registry or
+    # BuildKit failure must not block publishing the binary archives and SBOM.
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -176,7 +304,10 @@ jobs:
       - name: Generate checksums
         run: |
           cd release
-          sha256sum * > SHA256SUMS
+          # Write outside release/ first so the glob cannot pick up a
+          # partially written SHA256SUMS and hash the checksum file itself.
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0

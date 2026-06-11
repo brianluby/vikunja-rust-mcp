@@ -7,3 +7,6 @@
 # Coverage artifacts
 lcov.info
 *.profraw
+
+# Claude Code local state
+.claude/
