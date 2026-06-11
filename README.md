@@ -33,7 +33,86 @@ cargo build --release
 Tagged releases publish platform packages for Linux, macOS and Windows. Each
 release also includes `vikunja-rust-mcp-sbom.cdx.json`, a CycloneDX 1.5 SBOM
 generated from the locked Cargo dependency graph with all features and targets
-included.
+included, plus the following verification material:
+
+- `SHA256SUMS` — SHA-256 checksums of the archives and SBOM (the `.sig`/`.pem`
+  files are produced after the checksum file and are not listed in it; they
+  are verified via cosign instead).
+- `<artifact>.sig` / `<artifact>.pem` — Sigstore cosign keyless signatures
+  (and the short-lived signing certificate) for each archive, the SBOM and
+  `SHA256SUMS`, produced via the GitHub OIDC identity of the release workflow.
+- GitHub build provenance attestations (SLSA) for each archive, recorded via
+  `actions/attest-build-provenance` and queryable with the `gh` CLI.
+
+No long-lived signing keys exist for cosign or attestations; trust is rooted
+in the repository's GitHub Actions OIDC identity. Apple signing credentials,
+when configured, live only in GitHub Actions secrets.
+
+### Verifying a download
+
+Checksums (verifies only the file you downloaded):
+
+```bash
+grep vikunja-rust-mcp-macos-aarch64.tar.gz SHA256SUMS | shasum -a 256 --check
+```
+
+Cosign signature (keyless; requires [cosign](https://docs.sigstore.dev/)):
+
+```bash
+cosign verify-blob \
+  --signature vikunja-rust-mcp-macos-aarch64.tar.gz.sig \
+  --certificate vikunja-rust-mcp-macos-aarch64.tar.gz.pem \
+  --certificate-identity-regexp \
+    'https://github.com/brianluby/vikunja-rust-mcp/\.github/workflows/build\.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  vikunja-rust-mcp-macos-aarch64.tar.gz
+```
+
+Build provenance (requires the [gh](https://cli.github.com/) CLI):
+
+```bash
+gh attestation verify vikunja-rust-mcp-macos-aarch64.tar.gz \
+  --repo brianluby/vikunja-rust-mcp \
+  --signer-workflow brianluby/vikunja-rust-mcp/.github/workflows/build.yml
+```
+
+### macOS Gatekeeper
+
+When the `APPLE_CERTIFICATE_P12` secret is configured, tagged builds sign the
+macOS binary in the build job with a Developer ID Application certificate
+(hardened runtime, secure timestamp) and notarize it with `notarytool`, so
+downloads run without manual steps. Notarization tickets cannot be stapled to
+bare executables; Gatekeeper fetches the ticket online on first run. Inspect
+a signed binary with:
+
+```bash
+codesign --display --verbose=2 ./vikunja-rust-mcp
+spctl --assess --type execute --verbose ./vikunja-rust-mcp
+```
+
+Without an Apple Developer account the binary carries only the ad-hoc linker
+signature, and a browser download gains a `com.apple.quarantine` attribute
+that makes Gatekeeper kill it with SIGKILL (`Code Signature Invalid`). Two
+equivalent workarounds after verifying the checksum/signature above:
+
+```bash
+# remove the quarantine attribute
+xattr -d com.apple.quarantine ./vikunja-rust-mcp
+
+# or re-sign locally with a fresh ad-hoc signature
+codesign --force --sign - ./vikunja-rust-mcp
+```
+
+Downloads made with `curl`/`wget` are not quarantined and run as-is.
+
+### Windows code signing
+
+Windows binaries are currently unsigned; SmartScreen may warn on first run.
+Authenticode signing was evaluated: classic OV/EV certificates require a paid
+CA subscription and (since 2023) hardware-backed keys, and Azure Trusted
+Signing requires an Azure tenant. Either can be added to the release workflow
+later without changing artifact layout; until then, verify downloads with the
+cosign signature and checksums above.
 
 ## Configuration
 

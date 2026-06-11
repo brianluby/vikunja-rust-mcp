@@ -16,6 +16,8 @@ jobs:
   build:
     name: Build ${{ matrix.platform.name }}
     runs-on: ${{ matrix.platform.os }}
+    env:
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +47,66 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked
+
+      # Signs and notarizes the macOS binary when Apple signing secrets are
+      # configured; otherwise the binary ships with the default ad-hoc linker
+      # signature and the README documents the Gatekeeper workaround.
+      # Stapling is skipped: tickets cannot be stapled to bare Mach-O
+      # executables, Gatekeeper fetches the notarization ticket online.
+      - name: Sign and notarize macOS binary
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v') && env.HAS_APPLE_CERT == 'true'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          BINARY_NAME: ${{ matrix.platform.binary_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail closed: a partial Apple secret set is a misconfiguration that
+          # must break the release, not silently ship an unsigned binary.
+          for var in APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                     APPLE_NOTARY_KEY APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::APPLE_CERTIFICATE_P12 is set but $var is empty; configure the full Apple signing secret set or remove APPLE_CERTIFICATE_P12 to skip signing"
+              exit 1
+            fi
+          done
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          cleanup() {
+            security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+            rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary-key.p8" "$RUNNER_TEMP/notarize.zip"
+          }
+          trap cleanup EXIT
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 1200 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S 'apple-tool:,apple:' \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          codesign --force --timestamp --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "target/release/$BINARY_NAME"
+          codesign --verify --strict --verbose=2 \
+            "target/release/$BINARY_NAME"
+
+          printf '%s' "$APPLE_NOTARY_KEY" > "$RUNNER_TEMP/notary-key.p8"
+          ditto -c -k "target/release/$BINARY_NAME" \
+            "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary-key.p8" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait
 
       - name: Package Unix binary
         if: runner.os != 'Windows'
@@ -79,6 +141,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout
@@ -108,6 +172,33 @@ jobs:
             --spec-version 1.5 \
             --override-filename vikunja-rust-mcp-sbom.cdx
           mv vikunja-rust-mcp-sbom.cdx.json release/vikunja-rust-mcp-sbom.cdx.json
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            release/*.tar.gz
+            release/*.zip
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+
+      # Keyless signing via the GitHub OIDC identity of this workflow run.
+      # Verification material (.sig + .pem) is published next to each artifact.
+      - name: Sign artifacts and checksums with cosign
+        run: |
+          set -euo pipefail
+          for f in release/*.tar.gz release/*.zip release/*.cdx.json release/SHA256SUMS; do
+            cosign sign-blob --yes \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.pem" \
+              "$f"
+          done
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
