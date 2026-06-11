@@ -12,4 +12,5 @@ pub mod error;
 pub mod mcp;
 pub mod sandbox;
 pub mod schema;
+pub mod transfer;
 pub mod vikunja;

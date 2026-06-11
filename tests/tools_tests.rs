@@ -105,6 +105,10 @@ const EXPECTED_TOOLS: &[&str] = &[
     "vikunja_project_views_list",
     "vikunja_buckets_list",
     "vikunja_dates_resolve",
+    "vikunja_export_tasks",
+    "vikunja_export_project",
+    "vikunja_import_tasks_markdown",
+    "vikunja_import_tasks_csv",
 ];
 
 #[tokio::test]
@@ -4172,5 +4176,526 @@ async fn sandbox_leaves_base64_and_inline_flows_unaffected() {
         structured(&download)["content_base64"],
         BASE64.encode(b"inline bytes")
     );
+    client.cancel().await.unwrap();
+}
+
+// ----- Import/export backlog workflows ---------------------------------------
+
+#[tokio::test]
+async fn export_tasks_renders_all_formats_deterministically() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("filter", "project_id = 4"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([
+                    {
+                        "id": 2, "title": "Second, task", "description": "body",
+                        "done": true, "project_id": 4, "identifier": "VRM-2",
+                        "due_date": "2026-07-01T12:00:00Z", "priority": 3,
+                        "labels": [{"id": 1, "title": "zeta"}, {"id": 2, "title": "alpha"}]
+                    },
+                    {
+                        "id": 1, "title": "First", "description": "",
+                        "done": false, "project_id": 4, "identifier": "VRM-1",
+                        "due_date": "0001-01-01T00:00:00Z"
+                    }
+                ]))
+                .insert_header("x-pagination-total-pages", "1")
+                .insert_header("x-pagination-result-count", "2"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let result = call(
+        &client,
+        "vikunja_export_tasks",
+        json!({"format": "json", "project_id": 4}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["format"], "json");
+    assert_eq!(body["task_count"], 2);
+    assert_eq!(body["auto_pagination"]["pages_read"], 1);
+    assert_eq!(body["auto_pagination"]["truncated"], false);
+    let content: serde_json::Value =
+        serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+    // Deterministic: sorted by id ascending, zero dates omitted, labels sorted.
+    assert_eq!(content[0]["id"], 1);
+    assert!(content[0].get("due_date").is_none());
+    assert_eq!(content[1]["id"], 2);
+    assert_eq!(content[1]["labels"], json!(["alpha", "zeta"]));
+
+    let result = call(
+        &client,
+        "vikunja_export_tasks",
+        json!({"format": "markdown", "project_id": 4}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(
+        body["content"].as_str().unwrap(),
+        "- [ ] First\n- [x] Second, task\n  body\n"
+    );
+
+    let result = call(
+        &client,
+        "vikunja_export_tasks",
+        json!({"format": "csv", "project_id": 4}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    let csv = body["content"].as_str().unwrap();
+    let mut lines = csv.lines();
+    assert!(lines.next().unwrap().starts_with("id,identifier,title,"));
+    assert!(lines.next().unwrap().starts_with("1,VRM-1,First,"));
+    let second = lines.next().unwrap();
+    assert!(second.contains("\"Second, task\""), "{second}");
+    assert!(second.contains("alpha|zeta"), "{second}");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn export_tasks_walks_bounded_pages_and_reports_truncation() {
+    let server = MockServer::start().await;
+    for page in 1..=2u32 {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tasks"))
+            .and(query_param("page", page.to_string()))
+            .and(query_param("filter", "(done = false) && project_id = 4"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([
+                        {"id": page, "title": format!("Task {page}"), "project_id": 4}
+                    ]))
+                    .insert_header("x-pagination-total-pages", "5")
+                    .insert_header("x-pagination-result-count", "1"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_export_tasks",
+        json!({
+            "format": "json", "project_id": 4,
+            "filter": "done = false", "max_pages": 2
+        }),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["task_count"], 2);
+    assert_eq!(body["auto_pagination"]["pages_read"], 2);
+    assert_eq!(body["auto_pagination"]["page_cap"], 2);
+    assert_eq!(body["auto_pagination"]["truncated"], true);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn export_tasks_validates_arguments_before_any_request() {
+    let client = connect("http://127.0.0.1:1").await;
+
+    let err = call(
+        &client,
+        "vikunja_export_tasks",
+        json!({"format": "json", "max_pages": 51}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("max_pages"), "{}", data.message);
+
+    let err = call(&client, "vikunja_export_tasks", json!({"format": "yaml"}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::McpError(_)), "got {err:?}");
+
+    let err = call(
+        &client,
+        "vikunja_export_tasks",
+        json!({"format": "json", "filter": "(done = false"}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("parenthes"), "{}", data.message);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn export_project_includes_metadata_and_optional_tasks() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/4"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 4, "title": "Backlog", "description": "Plan", "identifier": "BL"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tasks"))
+        .and(query_param("filter", "project_id = 4"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 1, "title": "Only", "project_id": 4}]))
+                .insert_header("x-pagination-total-pages", "1")
+                .insert_header("x-pagination-result-count", "1"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let result = call(
+        &client,
+        "vikunja_export_project",
+        json!({"project_id": 4, "include_tasks": true, "format": "json"}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["project_id"], 4);
+    assert_eq!(body["task_count"], 1);
+    let content: serde_json::Value =
+        serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content["project"]["title"], "Backlog");
+    assert_eq!(content["tasks"][0]["title"], "Only");
+
+    let result = call(
+        &client,
+        "vikunja_export_project",
+        json!({"project_id": 4, "include_tasks": false, "format": "markdown"}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["task_count"], 0);
+    assert!(body.get("auto_pagination").is_none());
+    assert_eq!(body["content"].as_str().unwrap(), "# Backlog\n\nPlan\n");
+
+    // CSV has no place for project metadata; it requires the task list.
+    let err = call(
+        &client,
+        "vikunja_export_project",
+        json!({"project_id": 4, "include_tasks": false, "format": "csv"}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("include_tasks"), "{}", data.message);
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_markdown_dry_run_is_default_and_writes_nothing() {
+    let server = MockServer::start().await;
+    // Any write would hit this mock; it must never be called.
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/4/tasks"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_import_tasks_markdown",
+        json!({
+            "project_id": 4,
+            "markdown": "# Plan\n\n- [ ] First\n  with description\n- [x] Second\nbad line\n"
+        }),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(body["ok"], false, "an invalid row means not ok");
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["valid"], 2);
+    assert_eq!(body["invalid"], 1);
+    assert_eq!(body["would_create"], 2);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items[0]["status"], "would_create");
+    assert_eq!(items[0]["proposed"]["title"], "First");
+    assert_eq!(items[0]["proposed"]["description"], "with description");
+    assert_eq!(items[1]["status"], "would_create");
+    assert_eq!(items[2]["status"], "invalid");
+    assert_eq!(items[2]["line"], 6);
+    server.verify().await;
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_markdown_write_mode_creates_tasks_and_reports_failures() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/4/tasks"))
+        .and(body_json(json!({"title": "Good"})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 11, "title": "Good", "project_id": 4
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/4/tasks"))
+        .and(body_json(json!({"title": "Broken"})))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"message": "boom"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_import_tasks_markdown",
+        json!({
+            "project_id": 4,
+            "markdown": "- [ ] Good\n- [ ] Broken\n",
+            "dry_run": false
+        }),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["dry_run"], false);
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["created"], 1);
+    assert_eq!(body["failed"], 1);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items[0]["status"], "created");
+    assert_eq!(items[0]["task"]["id"], 11);
+    assert_eq!(items[1]["status"], "failed");
+    assert_eq!(items[1]["error"]["kind"], "server");
+    assert_eq!(items[1]["error"]["http_status"], 500);
+    server.verify().await;
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_write_mode_with_invalid_rows_writes_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/4/tasks"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_import_tasks_markdown",
+        json!({
+            "project_id": 4,
+            "markdown": "- [ ] Valid\nnot a task\n",
+            "dry_run": false
+        }),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["invalid"], 1);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items[0]["status"], "skipped");
+    assert_eq!(items[1]["status"], "invalid");
+    server.verify().await;
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_csv_dry_run_previews_and_validates() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/4/tasks"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_import_tasks_csv",
+        json!({
+            "project_id": 4,
+            "csv": "title,description,due_date,priority\n\
+                    Ship,\"Body, text\",2026-07-01T12:00:00Z,3\n\
+                    Bad date,,not-a-real-date,\n\
+                    ,missing title,,\n"
+        }),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["valid"], 1);
+    assert_eq!(body["invalid"], 2);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items[0]["status"], "would_create");
+    assert_eq!(items[0]["proposed"]["title"], "Ship");
+    assert_eq!(items[0]["proposed"]["due_date"], "2026-07-01T12:00:00Z");
+    assert_eq!(items[0]["proposed"]["priority"], 3);
+    assert_eq!(items[1]["status"], "invalid");
+    assert!(
+        items[1]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("date"),
+        "{}",
+        items[1]["error"]["message"]
+    );
+    assert_eq!(items[2]["status"], "invalid");
+    server.verify().await;
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_csv_resolves_date_shortcuts() {
+    let client = connect("http://127.0.0.1:1").await;
+    let result = call(
+        &client,
+        "vikunja_import_tasks_csv",
+        json!({
+            "project_id": 4,
+            "csv": "title,due_date\nSoon,tomorrow\n"
+        }),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["valid"], 1);
+    let due = body["items"][0]["proposed"]["due_date"].as_str().unwrap();
+    assert!(due.len() >= 20, "expected RFC 3339 timestamp, got {due}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn import_rejects_malformed_input_and_oversized_payloads() {
+    let client = connect("http://127.0.0.1:1").await;
+
+    // Whole-document CSV problems are tool errors, not per-item results.
+    let err = call(
+        &client,
+        "vikunja_import_tasks_csv",
+        json!({"project_id": 4, "csv": "title,labels\nTask,urgent\n"}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("labels"), "{}", data.message);
+
+    let err = call(
+        &client,
+        "vikunja_import_tasks_csv",
+        json!({"project_id": 4, "csv": "no header match\n"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ServiceError::McpError(_)), "got {err:?}");
+
+    // Empty imports are rejected.
+    let err = call(
+        &client,
+        "vikunja_import_tasks_markdown",
+        json!({"project_id": 4, "markdown": "# nothing here\n"}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("no task"), "{}", data.message);
+
+    // Oversized payloads are rejected before parsing.
+    let huge = "x".repeat(256 * 1024 + 1);
+    let err = call(
+        &client,
+        "vikunja_import_tasks_markdown",
+        json!({"project_id": 4, "markdown": huge}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("262144"), "{}", data.message);
+
+    // Too many rows are rejected before any write.
+    let many: String = (0..101).map(|i| format!("- [ ] Task {i}\n")).collect();
+    let err = call(
+        &client,
+        "vikunja_import_tasks_markdown",
+        json!({"project_id": 4, "markdown": many, "dry_run": false}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("100"), "{}", data.message);
+
+    // project_id is required by the schema.
+    let err = call(
+        &client,
+        "vikunja_import_tasks_csv",
+        json!({"csv": "title\nTask\n"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ServiceError::McpError(_)), "got {err:?}");
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn export_tools_are_read_only_and_import_tools_are_not() {
+    let client = connect("http://127.0.0.1:1").await;
+    let tools = client.list_all_tools().await.unwrap();
+    for name in ["vikunja_export_tasks", "vikunja_export_project"] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(
+            tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(true),
+            "{name} should be read-only"
+        );
+    }
+    for name in ["vikunja_import_tasks_markdown", "vikunja_import_tasks_csv"] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        assert_ne!(
+            tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(true),
+            "{name} must not be read-only"
+        );
+        assert_ne!(
+            tool.annotations.as_ref().and_then(|a| a.destructive_hint),
+            Some(true),
+            "{name} only creates tasks; it is not destructive"
+        );
+    }
     client.cancel().await.unwrap();
 }
