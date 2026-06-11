@@ -216,6 +216,10 @@ impl VikunjaClient {
                 let retriable = matches!(mapped, Error::Timeout { .. } | Error::Network { .. });
                 match (retry, retriable) {
                     (Some(retry_builder), true) => {
+                        // Only Timeout/Network errors reach this branch;
+                        // both carry static detail strings, so `%mapped`
+                        // can never surface Vikunja response content. Keep
+                        // that invariant if the retriable set ever grows.
                         warn!(endpoint, error = %mapped, "retrying idempotent request once");
                         if let Some(metrics) = &self.metrics {
                             metrics.record_vikunja_retry(endpoint);

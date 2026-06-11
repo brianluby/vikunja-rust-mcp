@@ -128,7 +128,7 @@ up" from "Vikunja is reachable" and observe traffic:
 | Endpoint | Auth | Behavior |
 |---|---|---|
 | `GET /healthz` | none | Cheap liveness: answers `ok` without touching Vikunja. Use for liveness probes and restart decisions. |
-| `GET /readyz` | none | Readiness: performs the same lightweight authenticated probe as the `vikunja://status` resource (one `GET /api/v1/projects?per_page=1`). Answers `200 ready` or `503 not ready: <class>` where `<class>` is a coarse error class (`network`, `timeout`, `auth`, `server`, ...). Use for readiness/traffic gating. |
+| `GET /readyz` | none | Readiness: performs the same lightweight authenticated probe as the `vikunja://status` resource (one `GET /api/v1/projects?per_page=1`). Answers `200 ready` or `503 not ready: <class>` where `<class>` is a coarse error class (`network`, `timeout`, `auth`, `server`, ...). The probe is capped at **5 s** regardless of `VIKUNJA_TIMEOUT_SECS`, so a hung instance fails closed quickly instead of stalling the orchestrator's own probe timeout. Use for readiness/traffic gating. |
 | `GET /metrics` | none, **disabled by default** | Prometheus text exposition; only served when `--http-enable-metrics` / `MCP_HTTP_ENABLE_METRICS=true` is set (404 otherwise). |
 
 `/readyz` and `/metrics` are deliberately **unauthenticated** (like

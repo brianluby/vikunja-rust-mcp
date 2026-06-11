@@ -34,6 +34,17 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_cli(&cli).context("invalid configuration")?;
     validate_metrics_transport(cli.transport, cli.http_enable_metrics)
         .context("invalid configuration")?;
+    // Validate the HTTP auth setup up front too, so misconfiguration fails
+    // before any client/server state is constructed.
+    let http_auth_token = match cli.transport {
+        Transport::Http => validate_http_auth(
+            &cli.bind,
+            cli.http_auth_token.as_deref(),
+            cli.http_allow_unauthenticated,
+        )
+        .context("invalid HTTP transport configuration")?,
+        Transport::Stdio => None,
+    };
     info!(
         vikunja_url = %config.vikunja_url,
         transport = ?cli.transport,
@@ -61,13 +72,14 @@ async fn main() -> anyhow::Result<()> {
             service.waiting().await?;
         }
         Transport::Http => {
-            let auth_token = validate_http_auth(
-                &cli.bind,
-                cli.http_auth_token.as_deref(),
-                cli.http_allow_unauthenticated,
+            serve_http(
+                server,
+                cli.bind,
+                cli.allowed_hosts,
+                http_auth_token,
+                metrics,
             )
-            .context("invalid HTTP transport configuration")?;
-            serve_http(server, cli.bind, cli.allowed_hosts, auth_token, metrics).await?;
+            .await?;
         }
     }
     Ok(())

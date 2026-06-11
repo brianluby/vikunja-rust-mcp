@@ -15,6 +15,14 @@ const DURATION_BUCKETS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Pre-formatted `le` label values for [`DURATION_BUCKETS`]. Kept as
+/// explicit float strings ("1.0", never "1") because the Prometheus text
+/// format expects float representation and strict OpenMetrics parsers may
+/// reject integer-looking values.
+const DURATION_BUCKET_LABELS: [&str; DURATION_BUCKETS.len()] = [
+    "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1.0", "2.5", "5.0", "10.0",
+];
+
 /// Route label for an HTTP request path. Unknown paths collapse into
 /// `"other"` so arbitrary client-supplied paths cannot grow the label set.
 pub fn route_label(path: &str) -> &'static str {
@@ -101,6 +109,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Metrics {
     /// Records one handled HTTP request.
+    ///
+    /// The counter and the duration histogram are guarded by separate locks
+    /// taken sequentially, so a concurrent scrape may observe the counter
+    /// incremented before the matching histogram observation lands. The two
+    /// families are semantically independent, so this momentary divergence
+    /// is harmless; it is a deliberate trade against holding one lock for
+    /// both updates.
     pub fn record_http_request(
         &self,
         route: &'static str,
@@ -150,7 +165,7 @@ impl Metrics {
         {
             let histogram = lock(&self.http_duration);
             let mut cumulative = 0u64;
-            for (le, bucket) in DURATION_BUCKETS.iter().zip(histogram.buckets.iter()) {
+            for (le, bucket) in DURATION_BUCKET_LABELS.iter().zip(histogram.buckets.iter()) {
                 cumulative += bucket;
                 let _ = writeln!(
                     out,
@@ -162,9 +177,11 @@ impl Metrics {
                 "vikunja_mcp_http_request_duration_seconds_bucket{{le=\"+Inf\"}} {}",
                 histogram.count
             );
+            // Debug formatting keeps the decimal point ("0.0", not "0"),
+            // matching the float representation the text format expects.
             let _ = writeln!(
                 out,
-                "vikunja_mcp_http_request_duration_seconds_sum {}",
+                "vikunja_mcp_http_request_duration_seconds_sum {:?}",
                 histogram.sum
             );
             let _ = writeln!(
@@ -272,7 +289,7 @@ mod tests {
             "{body}"
         );
         assert!(
-            body.contains("duration_seconds_bucket{le=\"10\"} 2"),
+            body.contains("duration_seconds_bucket{le=\"10.0\"} 2"),
             "{body}"
         );
         assert!(
@@ -280,6 +297,17 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("duration_seconds_count 3"), "{body}");
+    }
+
+    #[test]
+    fn bucket_labels_are_float_strings_matching_the_bounds() {
+        for (label, bound) in DURATION_BUCKET_LABELS.iter().zip(DURATION_BUCKETS.iter()) {
+            assert!(
+                label.contains('.'),
+                "le label {label} must look like a float"
+            );
+            assert_eq!(label.parse::<f64>().unwrap(), *bound, "label {label}");
+        }
     }
 
     #[test]
@@ -308,6 +336,7 @@ mod tests {
             "# TYPE vikunja_mcp_http_request_duration_seconds histogram",
             "# TYPE vikunja_mcp_vikunja_requests_total counter",
             "# TYPE vikunja_mcp_vikunja_retries_total counter",
+            "vikunja_mcp_http_request_duration_seconds_sum 0.0",
             "vikunja_mcp_http_request_duration_seconds_count 0",
         ] {
             assert!(body.contains(needle), "missing {needle} in:\n{body}");

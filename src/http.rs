@@ -10,7 +10,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::Request;
@@ -28,7 +28,13 @@ use crate::metrics::{Metrics, method_label, route_label, status_class_label};
 use crate::vikunja::VikunjaClient;
 
 /// Content type of the Prometheus text exposition format.
-const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Upper bound on how long `/readyz` waits for the Vikunja probe. Kept well
+/// below typical orchestrator probe timeouts so a slow upstream surfaces as
+/// a fast `503 not ready: timeout` instead of the probe itself timing out
+/// (the configured `VIKUNJA_TIMEOUT_SECS` may be as high as 30s+).
+const READYZ_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `Host` header values accepted by the HTTP transport: loopback names, the
 /// bind IP and any extra hosts from configuration (trimmed, blanks dropped).
@@ -121,12 +127,18 @@ pub fn build_router(
 }
 
 /// Readiness: verifies the configured Vikunja instance answers the existing
-/// lightweight probe. The response body carries only `ready` or a coarse
-/// error class — never tokens, headers, URLs or Vikunja response text.
+/// lightweight probe, capped at [`READYZ_PROBE_TIMEOUT`]. The response body
+/// carries only `ready` or a coarse error class — never tokens, headers,
+/// URLs or Vikunja response text.
 async fn readyz(client: &VikunjaClient) -> Response {
-    match client.probe().await {
-        Ok(_) => (StatusCode::OK, "ready\n").into_response(),
-        Err(err) => {
+    readyz_with_timeout(client, READYZ_PROBE_TIMEOUT).await
+}
+
+/// [`readyz`] with an explicit probe cap; fails closed to 503 on timeout.
+async fn readyz_with_timeout(client: &VikunjaClient, cap: Duration) -> Response {
+    match tokio::time::timeout(cap, client.probe()).await {
+        Ok(Ok(_)) => (StatusCode::OK, "ready\n").into_response(),
+        Ok(Err(err)) => {
             let kind = err.metric_label();
             warn!(kind, "readiness probe failed");
             (
@@ -134,6 +146,10 @@ async fn readyz(client: &VikunjaClient) -> Response {
                 format!("not ready: {kind}\n"),
             )
                 .into_response()
+        }
+        Err(_elapsed) => {
+            warn!(kind = "timeout", "readiness probe timed out");
+            (StatusCode::SERVICE_UNAVAILABLE, "not ready: timeout\n").into_response()
         }
     }
 }
@@ -205,6 +221,49 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readiness probe must answer 503 within the cap even when the
+    /// upstream hangs far beyond it (fail closed, fast).
+    #[tokio::test]
+    async fn readyz_fails_closed_when_probe_exceeds_the_cap() {
+        // Accept connections but never answer, so the probe hangs until the
+        // client's own (much longer) timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let _hold = socket;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let cli = <crate::config::Cli as clap::Parser>::try_parse_from([
+            "vikunja-rust-mcp",
+            "--vikunja-url",
+            &format!("http://{addr}"),
+            "--api-token",
+            "t",
+        ])
+        .expect("parse CLI");
+        let config = crate::config::Config::from_cli(&cli).expect("config");
+        let client = VikunjaClient::new(&config).expect("client");
+
+        let started = Instant::now();
+        let response = readyz_with_timeout(&client, Duration::from_millis(50)).await;
+        assert!(started.elapsed() < Duration::from_secs(2), "must fail fast");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], b"not ready: timeout\n");
+    }
 
     #[test]
     fn constant_time_eq_compares_correctly() {
