@@ -217,6 +217,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout
@@ -249,6 +251,7 @@ jobs:
             type=sha
 
       - name: Build and publish Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -259,6 +262,36 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The three signing steps below mirror the push decision exactly (main
+      # or v* tag), not merely "not a PR", so a future trigger change cannot
+      # sign an image that was never pushed.
+      - name: Install cosign
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+
+      # Keyless signing via the GitHub OIDC identity of this workflow run.
+      # Signs the immutable digest, which covers every tag pushed above.
+      - name: Sign Docker image with cosign
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DIGEST" ]; then
+            echo "::error::image digest is empty; build-push-action only outputs a digest when push=true"
+            exit 1
+          fi
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Attest Docker image provenance
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   release:
     name: Publish release packages
