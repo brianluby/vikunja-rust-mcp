@@ -18,10 +18,11 @@ use crate::transfer::{ExportFormat, MAX_IMPORT_BYTES, MAX_IMPORT_TASKS, export, 
 use crate::vikunja::VikunjaClient;
 use crate::vikunja::client::{TaskListOptions, saved_filter_options};
 use crate::vikunja::models::{
-    Bucket, Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectUpdate, ProjectView,
-    RelationKind, SavedFilter, SavedFilterCreate, SavedFilterQuery, SavedFilterSummary,
-    SavedFilterUpdate, Task, TaskAttachment, TaskComment, TaskCreate, TaskRelation, TaskReminder,
-    TaskUpdate, Team, User,
+    Bucket, Label, LabelCreate, LabelUpdate, Project, ProjectCreate, ProjectShareUpdate,
+    ProjectTeamShare, ProjectTeamShareCreate, ProjectUpdate, ProjectUserShare,
+    ProjectUserShareCreate, ProjectView, RelationKind, SavedFilter, SavedFilterCreate,
+    SavedFilterQuery, SavedFilterSummary, SavedFilterUpdate, Task, TaskAttachment, TaskComment,
+    TaskCreate, TaskRelation, TaskReminder, TaskUpdate, Team, User, UserWithPermission,
 };
 use crate::vikunja::pagination::{BoundedPage, PageInfo, PageParams, walk_pages};
 
@@ -528,6 +529,84 @@ pub struct TeamsListArgs {
     pub max_pages: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct ProjectUsersListArgs {
+    /// Numeric id of the project.
+    pub project_id: i64,
+    /// Search the project's users by name.
+    pub search: Option<String>,
+    /// 1-based page number (default 1).
+    pub page: Option<u32>,
+    /// Items per page.
+    pub per_page: Option<u32>,
+    /// If true, fetch up to max_pages pages starting at page 1 and return
+    /// them as one result with auto_pagination metadata. Cannot be combined
+    /// with page.
+    pub auto_paginate: Option<bool>,
+    /// Page cap for auto_paginate: 1-50, default 10. Requires
+    /// auto_paginate: true.
+    pub max_pages: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProjectUsersGrantArgs {
+    /// Numeric id of the project.
+    pub project_id: i64,
+    /// Unique username of the user to grant access to. Vikunja's sharing
+    /// API addresses new shares by username — look it up with
+    /// vikunja_users_search. No user is ever created.
+    pub username: String,
+    /// Permission level to grant: 0 read, 1 write, 2 admin.
+    pub permission: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProjectUsersUpdateArgs {
+    /// Numeric id of the project.
+    pub project_id: i64,
+    /// Numeric id of the user whose existing share to change.
+    pub user_id: i64,
+    /// New permission level: 0 read, 1 write, 2 admin.
+    pub permission: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProjectUsersRevokeArgs {
+    /// Numeric id of the project.
+    pub project_id: i64,
+    /// Numeric id of the user whose access to revoke.
+    pub user_id: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProjectTeamsGrantArgs {
+    /// Numeric id of the project.
+    pub project_id: i64,
+    /// Numeric id of the team to grant access to.
+    pub team_id: i64,
+    /// Permission level to grant: 0 read, 1 write, 2 admin.
+    pub permission: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProjectTeamsUpdateArgs {
+    /// Numeric id of the project.
+    pub project_id: i64,
+    /// Numeric id of the team whose existing share to change.
+    pub team_id: i64,
+    /// New permission level: 0 read, 1 write, 2 admin.
+    pub permission: i64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProjectTeamsRevokeArgs {
+    /// Numeric id of the project.
+    pub project_id: i64,
+    /// Numeric id of the team whose access to revoke.
+    pub team_id: i64,
+}
+
 /// Metadata describing a bounded auto-paginated fetch. Present in list
 /// results only when the call used `auto_paginate`.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -786,6 +865,67 @@ pub struct TeamListResult {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct UserListResult {
     pub users: Vec<User>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProjectUserListResult {
+    pub users: Vec<UserWithPermission>,
+    pub pagination: PageInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_pagination: Option<AutoPagination>,
+}
+
+/// Result of a project <-> user share mutation (grant/update/revoke).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProjectUserShareResult {
+    pub ok: bool,
+    pub message: String,
+    /// The project whose access was changed.
+    pub project_id: i64,
+    /// Always `user`.
+    pub subject_type: String,
+    /// Numeric id of the user. Known for update/revoke; grants address the
+    /// user by username instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i64>,
+    /// Username of the user, when the operation addressed them by username.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Permission level after the change: 0 read, 1 write, 2 admin. Absent
+    /// after a revoke.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission: Option<i64>,
+    /// Human-readable permission level: read, write or admin. Absent after
+    /// a revoke.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_name: Option<String>,
+    /// The share relation as returned by Vikunja. Absent after a revoke.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share: Option<ProjectUserShare>,
+}
+
+/// Result of a project <-> team share mutation (grant/update/revoke).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProjectTeamShareResult {
+    pub ok: bool,
+    pub message: String,
+    /// The project whose access was changed.
+    pub project_id: i64,
+    /// Always `team`.
+    pub subject_type: String,
+    /// Numeric id of the team.
+    pub team_id: i64,
+    /// Permission level after the change: 0 read, 1 write, 2 admin. Absent
+    /// after a revoke.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission: Option<i64>,
+    /// Human-readable permission level: read, write or admin. Absent after
+    /// a revoke.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_name: Option<String>,
+    /// The share relation as returned by Vikunja. Absent after a revoke.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share: Option<ProjectTeamShare>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1085,6 +1225,29 @@ fn positive(name: &str, value: i64) -> Result<i64, McpError> {
         return Err(Error::InvalidArgument(format!("{name} must be a positive integer")).to_mcp());
     }
     Ok(value)
+}
+
+/// Validates a project permission level: 0 read, 1 write, 2 admin.
+fn permission_level(value: i64) -> Result<i64, McpError> {
+    if !(0..=2).contains(&value) {
+        return Err(Error::InvalidArgument(format!(
+            "permission must be 0 (read), 1 (write) or 2 (admin), got {value}"
+        ))
+        .to_mcp());
+    }
+    Ok(value)
+}
+
+/// Human-readable name of a permission level. `None` for values outside the
+/// known 0-2 range (e.g. a level added by a newer Vikunja server), so an
+/// unknown level is never mislabeled.
+fn permission_name(level: i64) -> Option<&'static str> {
+    match level {
+        0 => Some("read"),
+        1 => Some("write"),
+        2 => Some("admin"),
+        _ => None,
+    }
 }
 
 fn page_params(page: Option<u32>, per_page: Option<u32>) -> Result<PageParams, McpError> {
@@ -3088,6 +3251,245 @@ impl VikunjaMcpServer {
             teams: page.items,
             pagination: page.info,
             auto_pagination: None,
+        }))
+    }
+
+    // -- Project sharing --
+    //
+    // Grant/update/revoke follow the Vikunja API exactly: new user shares
+    // are addressed by username, existing user shares by numeric user id,
+    // team shares by numeric team id. Updates use Vikunja's dedicated
+    // update endpoint — never revoke+grant.
+
+    #[tool(
+        name = "vikunja_project_users_list",
+        description = "List the users with access to a Vikunja project, including each user's permission level (0 read, 1 write, 2 admin). With auto_paginate, fetches up to max_pages pages (default 10, max 50) as one bounded result.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn project_users_list(
+        &self,
+        Parameters(args): Parameters<ProjectUsersListArgs>,
+    ) -> Result<Json<ProjectUserListResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        let cap = auto_page_cap(args.page, args.auto_paginate, args.max_pages)?;
+        let params = page_params(args.page, args.per_page)?;
+        if let Some(cap) = cap {
+            let bounded = walk_pages(cap, |page| {
+                let params = PageParams::new(Some(page), args.per_page);
+                let search = args.search.as_deref();
+                async move {
+                    self.client()
+                        .list_project_users(project_id, params, search)
+                        .await
+                }
+            })
+            .await?;
+            return Ok(Json(ProjectUserListResult {
+                pagination: bounded.last_info.clone(),
+                auto_pagination: Some(AutoPagination::from_bounded(&bounded)),
+                users: bounded.items,
+            }));
+        }
+        let page = self
+            .client()
+            .list_project_users(project_id, params, args.search.as_deref())
+            .await?;
+        Ok(Json(ProjectUserListResult {
+            users: page.items,
+            pagination: page.info,
+            auto_pagination: None,
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_project_users_grant",
+        description = "Grant a user access to a Vikunja project at an explicit permission level (0 read, 1 write, 2 admin). The user is addressed by their unique username (find it with vikunja_users_search); no user is ever created. Requires admin access to the project."
+    )]
+    pub async fn project_users_grant(
+        &self,
+        Parameters(args): Parameters<ProjectUsersGrantArgs>,
+    ) -> Result<Json<ProjectUserShareResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        let permission = permission_level(args.permission)?;
+        if args.username.trim().is_empty() {
+            return Err(Error::InvalidArgument("username must not be empty".to_string()).to_mcp());
+        }
+        let share = self
+            .client()
+            .add_project_user(
+                project_id,
+                &ProjectUserShareCreate {
+                    username: args.username.clone(),
+                    permission,
+                },
+            )
+            .await?;
+        Ok(Json(ProjectUserShareResult {
+            ok: true,
+            message: format!(
+                "granted user '{}' {} access to project {project_id}",
+                args.username,
+                permission_name(permission).unwrap_or("unknown")
+            ),
+            project_id,
+            subject_type: "user".to_string(),
+            user_id: None,
+            username: Some(args.username),
+            permission: Some(share.permission),
+            permission_name: permission_name(share.permission).map(String::from),
+            share: Some(share),
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_project_users_update",
+        description = "Change the permission level (0 read, 1 write, 2 admin) of a user who already has access to a Vikunja project. The user is addressed by their numeric user id. Requires admin access to the project."
+    )]
+    pub async fn project_users_update(
+        &self,
+        Parameters(args): Parameters<ProjectUsersUpdateArgs>,
+    ) -> Result<Json<ProjectUserShareResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        let user_id = positive("user_id", args.user_id)?;
+        let permission = permission_level(args.permission)?;
+        let share = self
+            .client()
+            .update_project_user(project_id, user_id, &ProjectShareUpdate { permission })
+            .await?;
+        Ok(Json(ProjectUserShareResult {
+            ok: true,
+            message: format!(
+                "set user {user_id}'s access to project {project_id} to {}",
+                permission_name(permission).unwrap_or("unknown")
+            ),
+            project_id,
+            subject_type: "user".to_string(),
+            user_id: Some(user_id),
+            username: None,
+            permission: Some(share.permission),
+            permission_name: permission_name(share.permission).map(String::from),
+            share: Some(share),
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_project_users_revoke",
+        description = "Revoke a user's access to a Vikunja project. The user is addressed by their numeric user id. Their share is removed immediately; re-grant it with vikunja_project_users_grant if needed. Requires admin access to the project.",
+        annotations(destructive_hint = true)
+    )]
+    pub async fn project_users_revoke(
+        &self,
+        Parameters(args): Parameters<ProjectUsersRevokeArgs>,
+    ) -> Result<Json<ProjectUserShareResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        let user_id = positive("user_id", args.user_id)?;
+        let message = self
+            .client()
+            .remove_project_user(project_id, user_id)
+            .await?;
+        Ok(Json(ProjectUserShareResult {
+            ok: true,
+            message: message.message,
+            project_id,
+            subject_type: "user".to_string(),
+            user_id: Some(user_id),
+            username: None,
+            permission: None,
+            permission_name: None,
+            share: None,
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_project_teams_grant",
+        description = "Grant a team access to a Vikunja project at an explicit permission level (0 read, 1 write, 2 admin). The team is addressed by its numeric team id (find it with vikunja_teams_list). Requires admin access to the project."
+    )]
+    pub async fn project_teams_grant(
+        &self,
+        Parameters(args): Parameters<ProjectTeamsGrantArgs>,
+    ) -> Result<Json<ProjectTeamShareResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        let team_id = positive("team_id", args.team_id)?;
+        let permission = permission_level(args.permission)?;
+        let share = self
+            .client()
+            .add_project_team(
+                project_id,
+                &ProjectTeamShareCreate {
+                    team_id,
+                    permission,
+                },
+            )
+            .await?;
+        Ok(Json(ProjectTeamShareResult {
+            ok: true,
+            message: format!(
+                "granted team {team_id} {} access to project {project_id}",
+                permission_name(permission).unwrap_or("unknown")
+            ),
+            project_id,
+            subject_type: "team".to_string(),
+            team_id,
+            permission: Some(share.permission),
+            permission_name: permission_name(share.permission).map(String::from),
+            share: Some(share),
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_project_teams_update",
+        description = "Change the permission level (0 read, 1 write, 2 admin) of a team that already has access to a Vikunja project. The team is addressed by its numeric team id. Requires admin access to the project."
+    )]
+    pub async fn project_teams_update(
+        &self,
+        Parameters(args): Parameters<ProjectTeamsUpdateArgs>,
+    ) -> Result<Json<ProjectTeamShareResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        let team_id = positive("team_id", args.team_id)?;
+        let permission = permission_level(args.permission)?;
+        let share = self
+            .client()
+            .update_project_team(project_id, team_id, &ProjectShareUpdate { permission })
+            .await?;
+        Ok(Json(ProjectTeamShareResult {
+            ok: true,
+            message: format!(
+                "set team {team_id}'s access to project {project_id} to {}",
+                permission_name(permission).unwrap_or("unknown")
+            ),
+            project_id,
+            subject_type: "team".to_string(),
+            team_id,
+            permission: Some(share.permission),
+            permission_name: permission_name(share.permission).map(String::from),
+            share: Some(share),
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_project_teams_revoke",
+        description = "Revoke a team's access to a Vikunja project. The team is addressed by its numeric team id. The team's share is removed immediately; re-grant it with vikunja_project_teams_grant if needed. Requires admin access to the project.",
+        annotations(destructive_hint = true)
+    )]
+    pub async fn project_teams_revoke(
+        &self,
+        Parameters(args): Parameters<ProjectTeamsRevokeArgs>,
+    ) -> Result<Json<ProjectTeamShareResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        let team_id = positive("team_id", args.team_id)?;
+        let message = self
+            .client()
+            .remove_project_team(project_id, team_id)
+            .await?;
+        Ok(Json(ProjectTeamShareResult {
+            ok: true,
+            message: message.message,
+            project_id,
+            subject_type: "team".to_string(),
+            team_id,
+            permission: None,
+            permission_name: None,
+            share: None,
         }))
     }
 

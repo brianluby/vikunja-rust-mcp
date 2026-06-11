@@ -25,9 +25,10 @@ use crate::metrics::Metrics;
 
 use super::models::{
     Bucket, Label, LabelCreate, LabelTask, LabelUpdate, Message, Project, ProjectCreate,
-    ProjectUpdate, ProjectView, RelationKind, SavedFilter, SavedFilterCreate, SavedFilterSummary,
-    SavedFilterUpdate, Task, TaskAssignee, TaskComment, TaskCreate, TaskRelation, TaskReminder,
-    TaskUpdate, Team, User,
+    ProjectShareUpdate, ProjectTeamShare, ProjectTeamShareCreate, ProjectUpdate, ProjectUserShare,
+    ProjectUserShareCreate, ProjectView, RelationKind, SavedFilter, SavedFilterCreate,
+    SavedFilterSummary, SavedFilterUpdate, Task, TaskAssignee, TaskComment, TaskCreate,
+    TaskRelation, TaskReminder, TaskUpdate, Team, User, UserWithPermission,
 };
 use super::pagination::{BoundedPage, Page, PageInfo, PageParams, walk_pages};
 
@@ -989,6 +990,129 @@ impl VikunjaClient {
             &format!("/projects/{project_id}/teams"),
             &query,
             params,
+        )
+        .await
+    }
+
+    // ----- Project sharing ----------------------------------------------------
+    //
+    // Vikunja's sharing API addresses *new* user shares by username
+    // (`PUT /projects/{id}/users` takes `{"username", "permission"}`), while
+    // updates and deletes address the existing share by numeric user id in
+    // the path. Team shares use the numeric team id everywhere.
+
+    /// `GET /projects/{id}/users` — users with access to a project,
+    /// including their `permission` level.
+    pub async fn list_project_users(
+        &self,
+        project_id: i64,
+        params: PageParams,
+        search: Option<&str>,
+    ) -> Result<Page<UserWithPermission>, Error> {
+        let mut query = Vec::new();
+        if let Some(search) = search {
+            query.push(("s", search.to_string()));
+        }
+        self.get_page(
+            "project_users.list",
+            &format!("/projects/{project_id}/users"),
+            &query,
+            params,
+        )
+        .await
+    }
+
+    /// `PUT /projects/{id}/users` — grant a user access to a project. The
+    /// user is identified by username in the payload.
+    pub async fn add_project_user(
+        &self,
+        project_id: i64,
+        body: &ProjectUserShareCreate,
+    ) -> Result<ProjectUserShare, Error> {
+        self.send_json(
+            "project_users.grant",
+            Method::PUT,
+            &format!("/projects/{project_id}/users"),
+            body,
+        )
+        .await
+    }
+
+    /// `POST /projects/{projectID}/users/{userID}` — change the permission
+    /// of an existing project <-> user share.
+    pub async fn update_project_user(
+        &self,
+        project_id: i64,
+        user_id: i64,
+        body: &ProjectShareUpdate,
+    ) -> Result<ProjectUserShare, Error> {
+        self.send_json(
+            "project_users.update",
+            Method::POST,
+            &format!("/projects/{project_id}/users/{user_id}"),
+            body,
+        )
+        .await
+    }
+
+    /// `DELETE /projects/{projectID}/users/{userID}` — revoke a user's
+    /// access to a project.
+    pub async fn remove_project_user(
+        &self,
+        project_id: i64,
+        user_id: i64,
+    ) -> Result<Message, Error> {
+        self.send_empty(
+            "project_users.revoke",
+            Method::DELETE,
+            &format!("/projects/{project_id}/users/{user_id}"),
+        )
+        .await
+    }
+
+    /// `PUT /projects/{id}/teams` — grant a team access to a project.
+    pub async fn add_project_team(
+        &self,
+        project_id: i64,
+        body: &ProjectTeamShareCreate,
+    ) -> Result<ProjectTeamShare, Error> {
+        self.send_json(
+            "project_teams.grant",
+            Method::PUT,
+            &format!("/projects/{project_id}/teams"),
+            body,
+        )
+        .await
+    }
+
+    /// `POST /projects/{projectID}/teams/{teamID}` — change the permission
+    /// of an existing project <-> team share.
+    pub async fn update_project_team(
+        &self,
+        project_id: i64,
+        team_id: i64,
+        body: &ProjectShareUpdate,
+    ) -> Result<ProjectTeamShare, Error> {
+        self.send_json(
+            "project_teams.update",
+            Method::POST,
+            &format!("/projects/{project_id}/teams/{team_id}"),
+            body,
+        )
+        .await
+    }
+
+    /// `DELETE /projects/{projectID}/teams/{teamID}` — revoke a team's
+    /// access to a project.
+    pub async fn remove_project_team(
+        &self,
+        project_id: i64,
+        team_id: i64,
+    ) -> Result<Message, Error> {
+        self.send_empty(
+            "project_teams.revoke",
+            Method::DELETE,
+            &format!("/projects/{project_id}/teams/{team_id}"),
         )
         .await
     }

@@ -96,6 +96,13 @@ const EXPECTED_TOOLS: &[&str] = &[
     "vikunja_task_attachments_delete",
     "vikunja_users_search",
     "vikunja_teams_list",
+    "vikunja_project_users_list",
+    "vikunja_project_users_grant",
+    "vikunja_project_users_update",
+    "vikunja_project_users_revoke",
+    "vikunja_project_teams_grant",
+    "vikunja_project_teams_update",
+    "vikunja_project_teams_revoke",
     "vikunja_filters_list",
     "vikunja_filters_get",
     "vikunja_filters_create",
@@ -179,6 +186,8 @@ async fn all_tools_are_registered_with_schemas() {
     for name in [
         "vikunja_task_labels_bulk_remove",
         "vikunja_tasks_bulk_unassign",
+        "vikunja_project_users_revoke",
+        "vikunja_project_teams_revoke",
     ] {
         let tool = tools.iter().find(|t| t.name == name).unwrap();
         assert_eq!(
@@ -187,7 +196,25 @@ async fn all_tools_are_registered_with_schemas() {
             "{name} should be marked destructive"
         );
     }
-    for name in ["vikunja_task_labels_bulk_add", "vikunja_tasks_bulk_assign"] {
+    let users_list_tool = tools
+        .iter()
+        .find(|t| t.name == "vikunja_project_users_list")
+        .unwrap();
+    assert_eq!(
+        users_list_tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint),
+        Some(true)
+    );
+    for name in [
+        "vikunja_task_labels_bulk_add",
+        "vikunja_tasks_bulk_assign",
+        "vikunja_project_users_grant",
+        "vikunja_project_users_update",
+        "vikunja_project_teams_grant",
+        "vikunja_project_teams_update",
+    ] {
         let tool = tools.iter().find(|t| t.name == name).unwrap();
         assert_ne!(
             tool.annotations.as_ref().and_then(|a| a.destructive_hint),
@@ -1572,6 +1599,414 @@ async fn users_search_returns_users() {
         .await
         .unwrap();
     assert_eq!(structured(&result)["users"][0]["username"], "ada");
+    client.cancel().await.unwrap();
+}
+
+// ----- project sharing through the tool layer ---------------------------------
+
+#[tokio::test]
+async fn project_users_list_returns_users_with_permissions() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/users"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([
+                    {"id": 3, "username": "ada", "name": "Ada Lovelace", "permission": 1}
+                ]))
+                .insert_header("x-pagination-total-pages", "1")
+                .insert_header("x-pagination-result-count", "1"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_project_users_list",
+        json!({"project_id": 7}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["users"][0]["username"], "ada");
+    assert_eq!(body["users"][0]["permission"], 1);
+    assert_eq!(body["pagination"]["total_pages"], 1);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_users_grant_returns_share_details() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/7/users"))
+        .and(body_json(json!({"username": "ada", "permission": 1})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 12, "username": "ada", "permission": 1
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_project_users_grant",
+        json!({"project_id": 7, "username": "ada", "permission": 1}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["project_id"], 7);
+    assert_eq!(body["subject_type"], "user");
+    assert_eq!(body["username"], "ada");
+    assert_eq!(body["permission"], 1);
+    assert_eq!(body["permission_name"], "write");
+    assert_eq!(body["share"]["id"], 12);
+    assert!(body.get("user_id").is_none());
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_users_grant_unknown_api_permission_is_not_mislabeled() {
+    // If the server reports a permission level outside the known 0-2 range
+    // (e.g. a future Vikunja version), the numeric value passes through but
+    // no permission_name is invented for it.
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/7/users"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 12, "username": "ada", "permission": 7
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_project_users_grant",
+        json!({"project_id": 7, "username": "ada", "permission": 1}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["permission"], 7);
+    assert!(body.get("permission_name").is_none());
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_users_update_changes_permission() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/projects/7/users/3"))
+        .and(body_json(json!({"permission": 2})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 12, "username": "ada", "permission": 2
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_project_users_update",
+        json!({"project_id": 7, "user_id": 3, "permission": 2}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["user_id"], 3);
+    assert_eq!(body["permission"], 2);
+    assert_eq!(body["permission_name"], "admin");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_users_revoke_removes_share() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/projects/7/users/3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": "The user was successfully removed from the project."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_project_users_revoke",
+        json!({"project_id": 7, "user_id": 3}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["subject_type"], "user");
+    assert_eq!(body["user_id"], 3);
+    assert!(body.get("permission").is_none());
+    assert!(body.get("permission_name").is_none());
+    assert!(body.get("share").is_none());
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_teams_grant_update_revoke_flow() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/7/teams"))
+        .and(body_json(json!({"team_id": 4, "permission": 0})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": 9, "team_id": 4, "permission": 0
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/projects/7/teams/4"))
+        .and(body_json(json!({"permission": 1})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 9, "team_id": 4, "permission": 1
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/projects/7/teams/4"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": "The team was successfully deleted."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+
+    let granted = call(
+        &client,
+        "vikunja_project_teams_grant",
+        json!({"project_id": 7, "team_id": 4, "permission": 0}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&granted);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["subject_type"], "team");
+    assert_eq!(body["team_id"], 4);
+    assert_eq!(body["permission"], 0);
+    assert_eq!(body["permission_name"], "read");
+    assert_eq!(body["share"]["id"], 9);
+
+    let updated = call(
+        &client,
+        "vikunja_project_teams_update",
+        json!({"project_id": 7, "team_id": 4, "permission": 1}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&updated);
+    assert_eq!(body["permission"], 1);
+    assert_eq!(body["permission_name"], "write");
+
+    let revoked = call(
+        &client,
+        "vikunja_project_teams_revoke",
+        json!({"project_id": 7, "team_id": 4}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&revoked);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["team_id"], 4);
+    assert!(body.get("permission").is_none());
+    assert!(body.get("share").is_none());
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_sharing_invalid_arguments_fail_before_any_request() {
+    // No mock server: a request would error differently, so getting an
+    // invalid-params error proves validation fired first.
+    let client = connect("http://127.0.0.1:1").await;
+
+    let cases: &[(&str, serde_json::Value, &str)] = &[
+        (
+            "vikunja_project_users_grant",
+            json!({"project_id": 0, "username": "ada", "permission": 1}),
+            "project_id",
+        ),
+        (
+            "vikunja_project_users_grant",
+            json!({"project_id": 7, "username": "  ", "permission": 1}),
+            "username",
+        ),
+        (
+            "vikunja_project_users_grant",
+            json!({"project_id": 7, "username": "ada", "permission": 3}),
+            "permission",
+        ),
+        (
+            "vikunja_project_users_update",
+            json!({"project_id": 7, "user_id": -1, "permission": 1}),
+            "user_id",
+        ),
+        (
+            "vikunja_project_users_update",
+            json!({"project_id": 7, "user_id": 3, "permission": -1}),
+            "permission",
+        ),
+        (
+            "vikunja_project_users_revoke",
+            json!({"project_id": 7, "user_id": 0}),
+            "user_id",
+        ),
+        (
+            "vikunja_project_teams_grant",
+            json!({"project_id": 7, "team_id": 0, "permission": 1}),
+            "team_id",
+        ),
+        (
+            "vikunja_project_teams_update",
+            json!({"project_id": 7, "team_id": 4, "permission": 5}),
+            "permission",
+        ),
+        (
+            "vikunja_project_teams_revoke",
+            json!({"project_id": -7, "team_id": 4}),
+            "project_id",
+        ),
+        (
+            "vikunja_project_users_list",
+            json!({"project_id": 0}),
+            "project_id",
+        ),
+    ];
+    for (tool, args, expected) in cases {
+        let err = call(&client, tool, args.clone()).await.unwrap_err();
+        let ServiceError::McpError(data) = err else {
+            panic!("{tool}: expected MCP error");
+        };
+        assert_eq!(
+            data.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "{tool}: wrong code"
+        );
+        assert!(
+            data.message.contains(expected),
+            "{tool}: message {:?} should mention {expected}",
+            data.message
+        );
+    }
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_users_grant_forbidden_surfaces_details() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v1/projects/7/users"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "code": 3004, "message": "You don't have the permission to do that."
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let err = call(
+        &client,
+        "vikunja_project_users_grant",
+        json!({"project_id": 7, "username": "ada", "permission": 2}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert!(data.message.contains("permission"));
+    let details = data.data.expect("error data");
+    assert_eq!(details["http_status"], 403);
+    assert_eq!(details["vikunja_error_code"], 3004);
+    assert_eq!(details["endpoint"], "project_users.grant");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_users_revoke_missing_share_is_invalid_params() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/projects/7/users/3"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "code": 6001, "message": "The user does not have access to that project."
+        })))
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let err = call(
+        &client,
+        "vikunja_project_users_revoke",
+        json!({"project_id": 7, "user_id": 3}),
+    )
+    .await
+    .unwrap_err();
+    let ServiceError::McpError(data) = err else {
+        panic!("expected MCP error");
+    };
+    assert_eq!(data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    let details = data.data.expect("error data");
+    assert_eq!(details["http_status"], 404);
+    assert_eq!(details["endpoint"], "project_users.revoke");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_users_list_auto_paginate_walks_pages() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/users"))
+        .and(query_param("page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 1, "username": "ada", "permission": 0}]))
+                .insert_header("x-pagination-total-pages", "2")
+                .insert_header("x-pagination-result-count", "1"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/projects/7/users"))
+        .and(query_param("page", "2"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id": 2, "username": "grace", "permission": 2}]))
+                .insert_header("x-pagination-total-pages", "2")
+                .insert_header("x-pagination-result-count", "1"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = connect(&server.uri()).await;
+    let result = call(
+        &client,
+        "vikunja_project_users_list",
+        json!({"project_id": 7, "auto_paginate": true}),
+    )
+    .await
+    .unwrap();
+    let body = structured(&result);
+    assert_eq!(body["users"].as_array().unwrap().len(), 2);
+    assert_eq!(body["auto_pagination"]["pages_read"], 2);
+    assert_eq!(body["auto_pagination"]["truncated"], false);
     client.cancel().await.unwrap();
 }
 
