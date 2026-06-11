@@ -159,6 +159,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # This job never pushes git commits; keep the token out of git config.
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -237,7 +240,10 @@ jobs:
       - name: Generate checksums
         run: |
           cd release
-          sha256sum -- * > SHA256SUMS
+          # Write outside release/ first so the glob cannot pick up a
+          # partially written SHA256SUMS and hash the checksum file itself.
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
