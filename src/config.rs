@@ -57,6 +57,12 @@ pub struct Cli {
     #[arg(long, env = "MCP_HTTP_ALLOW_UNAUTHENTICATED", default_value_t = false)]
     pub http_allow_unauthenticated: bool,
 
+    /// Expose Prometheus metrics at `GET /metrics` on the HTTP transport.
+    /// The metrics carry only fixed low-cardinality labels (no ids, titles
+    /// or tokens). Requires --transport http.
+    #[arg(long, env = "MCP_HTTP_ENABLE_METRICS", default_value_t = false)]
+    pub http_enable_metrics: bool,
+
     /// Base URL of the Vikunja instance, e.g. `https://try.vikunja.io`.
     #[arg(long, env = "VIKUNJA_URL")]
     pub vikunja_url: Option<String>,
@@ -165,6 +171,23 @@ pub enum ConfigError {
         "refusing to serve unauthenticated HTTP on non-loopback address {bind}: set MCP_HTTP_AUTH_TOKEN (recommended), or pass --http-allow-unauthenticated if an authenticating reverse proxy fronts this server"
     )]
     UnauthenticatedNonLoopback { bind: SocketAddr },
+    #[error(
+        "MCP_HTTP_ENABLE_METRICS/--http-enable-metrics requires --transport http: the stdio transport has no HTTP endpoint to serve /metrics from"
+    )]
+    MetricsRequireHttp,
+}
+
+/// Validates that Prometheus metrics are only enabled together with the
+/// HTTP transport (the stdio transport has no endpoint to serve them from,
+/// so a metrics flag there is a misconfiguration and fails fast).
+pub fn validate_metrics_transport(
+    transport: Transport,
+    enable_metrics: bool,
+) -> Result<(), ConfigError> {
+    if enable_metrics && transport != Transport::Http {
+        return Err(ConfigError::MetricsRequireHttp);
+    }
+    Ok(())
 }
 
 /// Validates the HTTP transport's authentication configuration and returns
@@ -557,6 +580,32 @@ mod tests {
         assert!(cli.allowed_hosts.is_empty());
         assert!(cli.http_auth_token.is_none());
         assert!(!cli.http_allow_unauthenticated);
+        assert!(!cli.http_enable_metrics);
+    }
+
+    #[test]
+    fn metrics_flag_is_parsed() {
+        let cli = cli(&["--http-enable-metrics"]);
+        assert!(cli.http_enable_metrics);
+    }
+
+    #[test]
+    fn metrics_with_http_transport_is_valid() {
+        for enabled in [true, false] {
+            assert!(validate_metrics_transport(Transport::Http, enabled).is_ok());
+        }
+    }
+
+    #[test]
+    fn metrics_without_metrics_flag_is_valid_on_stdio() {
+        assert!(validate_metrics_transport(Transport::Stdio, false).is_ok());
+    }
+
+    #[test]
+    fn metrics_with_stdio_transport_is_rejected() {
+        let err = validate_metrics_transport(Transport::Stdio, true).unwrap_err();
+        assert!(matches!(err, ConfigError::MetricsRequireHttp));
+        assert!(err.to_string().contains("--transport http"), "{err}");
     }
 
     #[test]
