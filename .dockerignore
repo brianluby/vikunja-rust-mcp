@@ -1,0 +1,9 @@
+/.git
+/.claude
+/.serena
+/target
+
+.env
+.env.*
+lcov.info
+*.profraw

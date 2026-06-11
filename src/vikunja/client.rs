@@ -17,8 +17,11 @@ use serde_json::Value;
 use tracing::{debug, warn};
 use url::Url;
 
+use std::sync::Arc;
+
 use crate::config::Config;
 use crate::error::Error;
+use crate::metrics::Metrics;
 
 use super::models::{
     Bucket, Label, LabelCreate, LabelTask, LabelUpdate, Message, Project, ProjectCreate,
@@ -116,6 +119,9 @@ pub struct VikunjaClient {
     http: reqwest::Client,
     base_url: Url,
     default_page_size: u32,
+    /// Optional operational metrics; outcomes/retries are recorded under
+    /// fixed endpoint-category and error-class labels only.
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl VikunjaClient {
@@ -150,7 +156,22 @@ impl VikunjaClient {
             http,
             base_url: config.vikunja_url.clone(),
             default_page_size: config.default_page_size,
+            metrics: None,
         })
+    }
+
+    /// Attaches a metrics registry; request outcomes and retries are then
+    /// recorded by endpoint category and error class.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Records the outcome of one request when metrics are enabled.
+    fn record_outcome(&self, endpoint: &'static str, outcome: &'static str) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_vikunja_request(endpoint, outcome);
+        }
     }
 
     /// Base URL of the Vikunja instance (without `/api/v1`).
@@ -186,6 +207,7 @@ impl VikunjaClient {
         } else {
             None
         };
+        let started = std::time::Instant::now();
 
         let first = builder.send().await;
         let response = match first {
@@ -195,25 +217,54 @@ impl VikunjaClient {
                 let retriable = matches!(mapped, Error::Timeout { .. } | Error::Network { .. });
                 match (retry, retriable) {
                     (Some(retry_builder), true) => {
+                        // Only Timeout/Network errors reach this branch;
+                        // both carry static detail strings, so `%mapped`
+                        // can never surface Vikunja response content. Keep
+                        // that invariant if the retriable set ever grows.
                         warn!(endpoint, error = %mapped, "retrying idempotent request once");
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_vikunja_retry(endpoint);
+                        }
                         tokio::time::sleep(RETRY_DELAY).await;
-                        retry_builder
-                            .send()
-                            .await
-                            .map_err(|e| Error::from_reqwest(endpoint, e))?
+                        match retry_builder.send().await {
+                            Ok(response) => response,
+                            Err(err) => {
+                                let mapped = Error::from_reqwest(endpoint, err);
+                                self.record_outcome(endpoint, mapped.metric_label());
+                                return Err(mapped);
+                            }
+                        }
                     }
-                    _ => return Err(mapped),
+                    _ => {
+                        self.record_outcome(endpoint, mapped.metric_label());
+                        return Err(mapped);
+                    }
                 }
             }
         };
 
         let status = response.status();
+        let duration_ms = started.elapsed().as_millis() as u64;
         if status.is_success() {
+            self.record_outcome(endpoint, "ok");
+            debug!(
+                endpoint,
+                status = status.as_u16(),
+                duration_ms,
+                "Vikunja API request"
+            );
             return Ok(response);
         }
         let body = response.bytes().await.unwrap_or_default();
         let error = Error::from_status(endpoint, status.as_u16(), &body);
-        warn!(endpoint, status = status.as_u16(), "Vikunja API error");
+        self.record_outcome(endpoint, error.metric_label());
+        warn!(
+            endpoint,
+            status = status.as_u16(),
+            kind = error.metric_label(),
+            duration_ms,
+            "Vikunja API error"
+        );
         Err(error)
     }
 
@@ -1248,7 +1299,12 @@ impl VikunjaClient {
             .get(self.api_url("/projects"))
             .query(&[("per_page", "1")]);
         let response = self.execute("status.probe", builder, true).await?;
-        Ok(response.status())
+        let status = response.status();
+        // Drain the (tiny, per_page=1) body so the connection returns to
+        // the keep-alive pool; dropping an unconsumed response forces the
+        // connection closed, which adds up under frequent readiness probes.
+        let _ = response.bytes().await;
+        Ok(status)
     }
 }
 

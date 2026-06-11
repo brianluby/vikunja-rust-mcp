@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::dates::{self, DateConfig, Resolution};
 use crate::error::{ApiErrorKind, Error};
 use crate::schema::strip_unsigned_formats;
+use crate::transfer::{ExportFormat, MAX_IMPORT_BYTES, MAX_IMPORT_TASKS, export, import};
 use crate::vikunja::VikunjaClient;
 use crate::vikunja::client::{TaskListOptions, saved_filter_options};
 use crate::vikunja::models::{
@@ -1083,6 +1084,140 @@ pub struct DownloadResult {
     pub content_base64: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct ExportTasksArgs {
+    /// Output format: `json`, `markdown` or `csv`.
+    pub format: ExportFormat,
+    /// Only export tasks from this project.
+    pub project_id: Option<i64>,
+    /// Vikunja filter expression, e.g. `done = false && priority >= 3`.
+    pub filter: Option<String>,
+    /// Search tasks by title.
+    pub search: Option<String>,
+    /// Field to sort by server-side, e.g. `due_date`. Without it, exported
+    /// tasks are sorted by id ascending for deterministic output.
+    pub sort_by: Option<String>,
+    /// Sort direction: `asc` or `desc`.
+    pub order_by: Option<String>,
+    /// Page cap for the bounded task fetch: 1-50, default 10 (500 tasks at
+    /// the default page size). The result reports truncation.
+    pub max_pages: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct ExportProjectArgs {
+    /// Numeric id of the project to export.
+    pub project_id: i64,
+    /// Include the project's tasks in the export. Required true for csv,
+    /// which has no representation for project metadata.
+    pub include_tasks: bool,
+    /// Output format: `json`, `markdown` or `csv`.
+    pub format: ExportFormat,
+    /// Page cap for the bounded task fetch: 1-50, default 10.
+    pub max_pages: Option<u32>,
+}
+
+/// One exported document plus metadata about what went into it.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct ExportResult {
+    /// The format that was rendered: `json`, `markdown` or `csv`.
+    pub format: String,
+    /// The exported document.
+    pub content: String,
+    /// Number of tasks included in the document.
+    pub task_count: usize,
+    /// The exported project, when the export was scoped to one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<i64>,
+    /// Metadata of the bounded task fetch; omitted when no tasks were
+    /// fetched (include_tasks: false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_pagination: Option<AutoPagination>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ImportMarkdownArgs {
+    /// Id of the project the tasks are created in.
+    pub project_id: i64,
+    /// Markdown checklist: one task per `- [ ] Title` line, optional
+    /// description lines indented below it. At most 256 KiB and 100 tasks.
+    pub markdown: String,
+    /// Default true: validate and preview without writing anything. Set
+    /// false to actually create the tasks.
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ImportCsvArgs {
+    /// Id of the project the tasks are created in.
+    pub project_id: i64,
+    /// CSV with a header row. Columns: title (required), description,
+    /// due_date (RFC 3339 or a date shortcut), priority (0-5). At most
+    /// 256 KiB and 100 tasks.
+    pub csv: String,
+    /// Default true: validate and preview without writing anything. Set
+    /// false to actually create the tasks.
+    pub dry_run: Option<bool>,
+}
+
+/// Result of an import call: aggregate counts plus one entry per input row,
+/// in input order.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct ImportResult {
+    /// Dry run: true when every row is valid. Write mode: true when every
+    /// row was valid and created successfully.
+    pub ok: bool,
+    pub dry_run: bool,
+    pub project_id: i64,
+    /// Number of input rows.
+    pub total: usize,
+    /// Rows that passed validation.
+    pub valid: usize,
+    /// Rows that failed validation.
+    pub invalid: usize,
+    /// Dry run only: number of tasks a write would create.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub would_create: Option<usize>,
+    /// Write mode only: number of tasks created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created: Option<usize>,
+    /// Write mode only: number of valid rows whose create call failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<usize>,
+    /// Per-row outcomes, in input order.
+    pub items: Vec<ImportItemResult>,
+}
+
+/// Outcome of one input row of an import.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(transform = RecursiveTransform(strip_unsigned_formats))]
+pub struct ImportItemResult {
+    /// 1-based input line the row started on.
+    pub line: usize,
+    pub ok: bool,
+    /// `would_create` (valid, dry run), `created`, `invalid` (failed
+    /// validation), `failed` (valid but the create call failed) or
+    /// `skipped` (valid, but other rows were invalid so nothing was
+    /// written).
+    pub status: String,
+    /// Title of the task, when the row parsed far enough to have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The exact create payload a write would send, for valid rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed: Option<TaskCreate>,
+    /// The created task, in write mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<Task>,
+    /// Failure detail for invalid or failed rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<BulkItemError>,
+}
+
 // ----- Argument validation helpers -------------------------------------------
 
 fn positive(name: &str, value: i64) -> Result<i64, McpError> {
@@ -1538,6 +1673,296 @@ pub(crate) async fn load_project_buckets(
         buckets,
         pagination: page.info,
     })
+}
+
+/// Validates the page cap of a bounded export fetch: 1 to
+/// [`MAX_AUTO_MAX_PAGES`], default [`DEFAULT_AUTO_MAX_PAGES`].
+fn export_page_cap(max_pages: Option<u32>) -> Result<u32, McpError> {
+    let cap = max_pages.unwrap_or(DEFAULT_AUTO_MAX_PAGES);
+    if !(1..=MAX_AUTO_MAX_PAGES).contains(&cap) {
+        return Err(Error::InvalidArgument(format!(
+            "max_pages must be between 1 and {MAX_AUTO_MAX_PAGES}, got {cap}"
+        ))
+        .to_mcp());
+    }
+    Ok(cap)
+}
+
+/// Maps a JSON rendering failure of an export to a structured MCP error.
+/// Export shapes serialize infallibly today, but the error path must stay
+/// an error, never a panic.
+fn json_render_error(err: serde_json::Error) -> McpError {
+    Error::InvalidResponse {
+        endpoint: "export.render",
+        detail: format!("failed to render JSON export: {err}"),
+    }
+    .to_mcp()
+}
+
+/// Rejects import payloads above [`MAX_IMPORT_BYTES`] before parsing.
+fn check_import_size(name: &str, input: &str) -> Result<(), McpError> {
+    if input.len() > MAX_IMPORT_BYTES {
+        return Err(Error::InvalidArgument(format!(
+            "{name} is {} bytes; the maximum supported import is {MAX_IMPORT_BYTES} bytes",
+            input.len()
+        ))
+        .to_mcp());
+    }
+    Ok(())
+}
+
+/// Resolves the raw due date of an import row: RFC 3339 timestamps pass
+/// through, anything else is tried as a date shortcut. A clear shortcut
+/// means no due date.
+fn resolve_import_date(
+    raw: &str,
+    reference: &DateTime<Local>,
+    dates: &DateConfig,
+) -> Result<Option<String>, String> {
+    if DateTime::parse_from_rfc3339(raw).is_ok() {
+        return Ok(Some(raw.to_string()));
+    }
+    match dates::resolve(raw, reference, dates) {
+        Ok(Resolution::Clear) => Ok(None),
+        Ok(Resolution::Timestamp { datetime, .. }) => {
+            Ok(Some(datetime.to_rfc3339_opts(SecondsFormat::Secs, true)))
+        }
+        Err(_) => Err(format!(
+            "due_date must be an RFC 3339 timestamp like 2026-07-01T12:00:00Z or a supported \
+             date shortcut, got {raw:?}"
+        )),
+    }
+}
+
+/// One import row after validation: either a ready create payload or the
+/// reason the row is invalid.
+struct ImportPrep {
+    line: usize,
+    title: Option<String>,
+    outcome: Result<TaskCreate, String>,
+}
+
+/// Turns parsed rows into validated create payloads. Every row is checked,
+/// so one result reports all problems at once.
+fn prepare_import_rows(
+    rows: Vec<import::RowResult>,
+    reference: &DateTime<Local>,
+    dates: &DateConfig,
+) -> Vec<ImportPrep> {
+    rows.into_iter()
+        .map(|row| match row {
+            Ok(task) => {
+                let due_date = match task.due_date.as_deref() {
+                    Some(raw) => resolve_import_date(raw, reference, dates),
+                    None => Ok(None),
+                };
+                match due_date {
+                    Ok(due_date) => ImportPrep {
+                        line: task.line,
+                        title: Some(task.title.clone()),
+                        outcome: Ok(TaskCreate {
+                            title: task.title,
+                            description: task.description,
+                            due_date,
+                            priority: task.priority,
+                            ..Default::default()
+                        }),
+                    },
+                    Err(message) => ImportPrep {
+                        line: task.line,
+                        title: Some(task.title),
+                        outcome: Err(message),
+                    },
+                }
+            }
+            Err(issue) => ImportPrep {
+                line: issue.line,
+                title: None,
+                outcome: Err(issue.message),
+            },
+        })
+        .collect()
+}
+
+/// An [`ImportItemResult`] for a row that failed validation.
+fn invalid_import_item(line: usize, title: Option<String>, message: String) -> ImportItemResult {
+    ImportItemResult {
+        line,
+        ok: false,
+        status: "invalid".to_string(),
+        title,
+        proposed: None,
+        task: None,
+        error: Some(BulkItemError::from_error(&Error::InvalidArgument(message))),
+    }
+}
+
+/// Shared core of the import tools: validates all rows first, then either
+/// previews (dry run), refuses to write when any row is invalid, or creates
+/// the tasks one by one with per-item results and no retries.
+async fn run_import(
+    client: &VikunjaClient,
+    dates: &DateConfig,
+    project_id: i64,
+    rows: Vec<import::RowResult>,
+    dry_run: bool,
+) -> Result<ImportResult, McpError> {
+    if rows.is_empty() {
+        return Err(Error::InvalidArgument(
+            "input contains no task rows; nothing to import".to_string(),
+        )
+        .to_mcp());
+    }
+    if rows.len() > MAX_IMPORT_TASKS {
+        return Err(Error::InvalidArgument(format!(
+            "input has {} rows; at most {MAX_IMPORT_TASKS} tasks are allowed per import — split \
+             the file",
+            rows.len()
+        ))
+        .to_mcp());
+    }
+
+    let reference = Local::now();
+    let preps = prepare_import_rows(rows, &reference, dates);
+    let total = preps.len();
+    let invalid = preps.iter().filter(|prep| prep.outcome.is_err()).count();
+    let valid = total - invalid;
+
+    if dry_run {
+        let items = preps
+            .into_iter()
+            .map(|prep| match prep.outcome {
+                Ok(proposed) => ImportItemResult {
+                    line: prep.line,
+                    ok: true,
+                    status: "would_create".to_string(),
+                    title: prep.title,
+                    proposed: Some(proposed),
+                    task: None,
+                    error: None,
+                },
+                Err(message) => invalid_import_item(prep.line, prep.title, message),
+            })
+            .collect();
+        return Ok(ImportResult {
+            ok: invalid == 0,
+            dry_run: true,
+            project_id,
+            total,
+            valid,
+            invalid,
+            would_create: Some(valid),
+            created: None,
+            failed: None,
+            items,
+        });
+    }
+
+    if invalid > 0 {
+        // Write mode requires a fully valid input: nothing is written, so a
+        // fixed file can be re-imported without creating duplicates.
+        let items = preps
+            .into_iter()
+            .map(|prep| match prep.outcome {
+                Ok(proposed) => ImportItemResult {
+                    line: prep.line,
+                    ok: false,
+                    status: "skipped".to_string(),
+                    title: prep.title,
+                    proposed: Some(proposed),
+                    task: None,
+                    error: None,
+                },
+                Err(message) => invalid_import_item(prep.line, prep.title, message),
+            })
+            .collect();
+        return Ok(ImportResult {
+            ok: false,
+            dry_run: false,
+            project_id,
+            total,
+            valid,
+            invalid,
+            would_create: None,
+            created: Some(0),
+            failed: Some(0),
+            items,
+        });
+    }
+
+    let mut items = Vec::with_capacity(total);
+    let mut created = 0usize;
+    // invalid == 0 here, so the filter drops nothing; it just lets the
+    // write loop hold plain payloads instead of re-proving the invariant.
+    let writes = preps.into_iter().filter_map(|prep| {
+        prep.outcome
+            .ok()
+            .map(|proposed| (prep.line, prep.title, proposed))
+    });
+    for (line, title, proposed) in writes {
+        match client.create_task(project_id, &proposed).await {
+            Ok(task) => {
+                created += 1;
+                items.push(ImportItemResult {
+                    line,
+                    ok: true,
+                    status: "created".to_string(),
+                    title,
+                    proposed: Some(proposed),
+                    task: Some(task),
+                    error: None,
+                });
+            }
+            Err(err) => items.push(ImportItemResult {
+                line,
+                ok: false,
+                status: "failed".to_string(),
+                title,
+                proposed: Some(proposed),
+                task: None,
+                error: Some(BulkItemError::from_error(&err)),
+            }),
+        }
+    }
+    let failed = total - created;
+    Ok(ImportResult {
+        ok: failed == 0,
+        dry_run: false,
+        project_id,
+        total,
+        valid,
+        invalid,
+        would_create: None,
+        created: Some(created),
+        failed: Some(failed),
+        items,
+    })
+}
+
+/// Fetches up to `cap` pages of tasks for an export and normalizes them
+/// into deterministic export rows: without a server-side sort, tasks are
+/// ordered by id ascending.
+async fn fetch_export_tasks(
+    client: &VikunjaClient,
+    options: TaskListOptions,
+    cap: u32,
+) -> Result<(Vec<export::ExportTask>, AutoPagination), Error> {
+    let bounded = walk_pages(cap, |page| {
+        let mut options = options.clone();
+        options.page = Some(page);
+        async move { client.list_tasks(&options).await }
+    })
+    .await?;
+    let auto_pagination = AutoPagination::from_bounded(&bounded);
+    let mut tasks: Vec<export::ExportTask> = bounded
+        .items
+        .iter()
+        .map(export::ExportTask::from_task)
+        .collect();
+    if options.sort_by.is_none() {
+        export::sort_by_id(&mut tasks);
+    }
+    Ok((tasks, auto_pagination))
 }
 
 fn oversized_upload(size: usize) -> Error {
@@ -3250,6 +3675,143 @@ impl VikunjaMcpServer {
             tasks: page.items,
             pagination: page.info,
         }))
+    }
+
+    // -- Import/export --
+
+    #[tool(
+        name = "vikunja_export_tasks",
+        description = "Export tasks to JSON, Markdown checklist or CSV for migration/reporting. Read-only and deterministic: bounded pagination (max_pages, default 10, max 50), tasks sorted by id unless sort_by is given. Attachments and comments are not exported.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn export_tasks(
+        &self,
+        Parameters(args): Parameters<ExportTasksArgs>,
+    ) -> Result<Json<ExportResult>, McpError> {
+        let cap = export_page_cap(args.max_pages)?;
+        if let Some(project_id) = args.project_id {
+            positive("project_id", project_id)?;
+        }
+        if let Some(filter) = args.filter.as_deref() {
+            validate_filter_expression("filter", filter)?;
+        }
+        let options = TaskListOptions {
+            search: args.search,
+            filter: args.filter,
+            project_id: args.project_id,
+            sort_by: args.sort_by,
+            order_by: args.order_by,
+            ..Default::default()
+        };
+        let (tasks, auto_pagination) = fetch_export_tasks(self.client(), options, cap).await?;
+        let content = match args.format {
+            ExportFormat::Json => export::tasks_to_json(&tasks).map_err(json_render_error)?,
+            ExportFormat::Markdown => export::tasks_to_markdown(&tasks),
+            ExportFormat::Csv => export::tasks_to_csv(&tasks),
+        };
+        Ok(Json(ExportResult {
+            format: args.format.as_str().to_string(),
+            content,
+            task_count: tasks.len(),
+            project_id: args.project_id,
+            auto_pagination: Some(auto_pagination),
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_export_project",
+        description = "Export one project's metadata — and optionally its tasks (bounded by max_pages) — to JSON, Markdown or CSV. CSV carries only tasks, so it requires include_tasks: true. Read-only; attachments and comments are not exported.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn export_project(
+        &self,
+        Parameters(args): Parameters<ExportProjectArgs>,
+    ) -> Result<Json<ExportResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        let cap = export_page_cap(args.max_pages)?;
+        if args.format == ExportFormat::Csv && !args.include_tasks {
+            return Err(Error::InvalidArgument(
+                "csv exports contain only tasks; set include_tasks: true, or use json/markdown \
+                 for project metadata alone"
+                    .to_string(),
+            )
+            .to_mcp());
+        }
+        let project = self.client().get_project(project_id).await?;
+        let export_project = export::ExportProject::from_project(&project);
+        let (tasks, auto_pagination) = if args.include_tasks {
+            let options = TaskListOptions {
+                project_id: Some(project_id),
+                ..Default::default()
+            };
+            let (tasks, auto) = fetch_export_tasks(self.client(), options, cap).await?;
+            (Some(tasks), Some(auto))
+        } else {
+            (None, None)
+        };
+        let content = match args.format {
+            ExportFormat::Json => export::project_to_json(&export_project, tasks.as_deref())
+                .map_err(json_render_error)?,
+            ExportFormat::Markdown => {
+                export::project_to_markdown(&export_project, tasks.as_deref())
+            }
+            ExportFormat::Csv => export::tasks_to_csv(tasks.as_deref().unwrap_or_default()),
+        };
+        Ok(Json(ExportResult {
+            format: args.format.as_str().to_string(),
+            content,
+            task_count: tasks.as_ref().map_or(0, Vec::len),
+            project_id: Some(project_id),
+            auto_pagination,
+        }))
+    }
+
+    #[tool(
+        name = "vikunja_import_tasks_markdown",
+        description = "Import tasks into a project from a Markdown checklist (`- [ ] Title` lines, indented description lines below). Dry-run by default: validates every row and previews the creates without writing. Set dry_run: false to create; writes happen only when all rows are valid, with per-item results and no retries. Caps: 256 KiB, 100 tasks."
+    )]
+    pub async fn import_tasks_markdown(
+        &self,
+        Parameters(args): Parameters<ImportMarkdownArgs>,
+    ) -> Result<Json<ImportResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        check_import_size("markdown", &args.markdown)?;
+        let rows = import::parse_markdown(&args.markdown);
+        Ok(Json(
+            run_import(
+                self.client(),
+                self.dates(),
+                project_id,
+                rows,
+                args.dry_run.unwrap_or(true),
+            )
+            .await?,
+        ))
+    }
+
+    #[tool(
+        name = "vikunja_import_tasks_csv",
+        description = "Import tasks into a project from CSV with a header row; columns: title (required), description, due_date (RFC 3339 or date shortcut), priority (0-5). Labels are not imported. Dry-run by default: validates every row and previews the creates without writing. Set dry_run: false to create; writes happen only when all rows are valid, with per-item results and no retries. Caps: 256 KiB, 100 tasks."
+    )]
+    pub async fn import_tasks_csv(
+        &self,
+        Parameters(args): Parameters<ImportCsvArgs>,
+    ) -> Result<Json<ImportResult>, McpError> {
+        let project_id = positive("project_id", args.project_id)?;
+        check_import_size("csv", &args.csv)?;
+        let rows = import::parse_csv(&args.csv).map_err(|message| {
+            Error::InvalidArgument(format!("invalid CSV: {message}")).to_mcp()
+        })?;
+        Ok(Json(
+            run_import(
+                self.client(),
+                self.dates(),
+                project_id,
+                rows,
+                args.dry_run.unwrap_or(true),
+            )
+            .await?,
+        ))
     }
 }
 
